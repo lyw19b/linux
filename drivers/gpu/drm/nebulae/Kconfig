@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+config DRM_NEBULAE
+	tristate "Nebulae DRM graphics/display driver"
+	depends on DRM
+	depends on OF && HAS_IOMEM
+	select DRM_GEM_SHMEM_HELPER
+	select DRM_KMS_HELPER
+	help
+	  DRM graphics/display driver for the Nebulae GPU exposed by the QEMU
+	  LAXPUSOC LoongArch64 machine.
+
+	  This driver is independent from drivers/accel/nebulae, which is kept
+	  for accelerator compute workloads.
