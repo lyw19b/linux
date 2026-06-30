@@ -119,7 +119,10 @@ int nebulae_get_param_value(struct nebulae_device *ndev, u32 param,
 		*value = DRM_NEBULAE_UAPI_VERSION;
 		break;
 	case DRM_NEBULAE_PARAM_SUBMIT_CAPS:
-		*value = DRM_NEBULAE_SUBMIT_CAP_CMD_BO;
+		*value = DRM_NEBULAE_SUBMIT_CAP_ASYNC |
+			 DRM_NEBULAE_SUBMIT_CAP_CMD_BO |
+			 DRM_NEBULAE_SUBMIT_CAP_SYNCOBJ |
+			 DRM_NEBULAE_SUBMIT_CAP_FENCE_FD;
 		break;
 	default:
 		return -EINVAL;
@@ -205,6 +208,9 @@ int nebulae_device_probe(struct platform_device *pdev)
 	atomic64_set(&ndev->complete_irq_count, 0);
 	atomic64_set(&ndev->fault_irq_count, 0);
 	atomic64_set(&ndev->display_irq_count, 0);
+	ndev->last_submit_cookie = 0;
+	ndev->last_submit_pt_base = 0;
+	ndev->last_submit_asid = 0;
 	ndev->last_irq_status = 0;
 	ndev->last_display_irq_status = 0;
 

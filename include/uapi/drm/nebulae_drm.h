@@ -47,6 +47,7 @@ enum drm_nebulae_param {
 #define DRM_NEBULAE_SUBMIT_CAP_CMD_BO			(1ULL << 1)
 #define DRM_NEBULAE_SUBMIT_CAP_SYNCOBJ			(1ULL << 2)
 #define DRM_NEBULAE_SUBMIT_CAP_FENCE_FD			(1ULL << 3)
+#define DRM_NEBULAE_SUBMIT_CAP_ASYNC			(1ULL << 4)
 
 #define DRM_NEBULAE_BO_WC				(1U << 0)
 #define DRM_NEBULAE_BO_NO_AUTO_BIND			(1U << 1)

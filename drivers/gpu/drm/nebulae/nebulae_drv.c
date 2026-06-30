@@ -41,8 +41,7 @@ DEFINE_DRM_GEM_FOPS(nebulae_fops);
 
 const struct drm_driver nebulae_drm_driver = {
 	.driver_features = DRIVER_GEM | DRIVER_RENDER | DRIVER_MODESET |
-			   DRIVER_ATOMIC | DRIVER_SYNCOBJ |
-			   DRIVER_SYNCOBJ_TIMELINE,
+			   DRIVER_ATOMIC | DRIVER_SYNCOBJ,
 	DRM_GEM_SHMEM_DRIVER_OPS,
 	.open = nebulae_file_open,
 	.postclose = nebulae_file_postclose,

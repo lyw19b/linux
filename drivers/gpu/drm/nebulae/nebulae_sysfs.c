@@ -100,6 +100,16 @@ static ssize_t failed_jobs_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(failed_jobs);
 
+static ssize_t signaled_fences_show(struct device *dev,
+				    struct device_attribute *attr, char *buf)
+{
+	struct nebulae_device *ndev = nebulae_sysfs_device(dev);
+
+	return sysfs_emit(buf, "%lld\n",
+			  atomic64_read(&ndev->signaled_fences));
+}
+static DEVICE_ATTR_RO(signaled_fences);
+
 static ssize_t irq_count_show(struct device *dev,
 			      struct device_attribute *attr, char *buf)
 {
@@ -138,6 +148,7 @@ static struct attribute *nebulae_sysfs_attrs[] = {
 	&dev_attr_running_jobs.attr,
 	&dev_attr_finished_jobs.attr,
 	&dev_attr_failed_jobs.attr,
+	&dev_attr_signaled_fences.attr,
 	&dev_attr_irq_count.attr,
 	&dev_attr_display_flips.attr,
 	&dev_attr_last_error.attr,

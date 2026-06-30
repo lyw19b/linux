@@ -21,11 +21,21 @@ void nebulae_ctx_fini(struct nebulae_device *ndev)
 int nebulae_file_open(struct drm_device *drm, struct drm_file *file)
 {
 	struct nebulae_device *ndev = to_nebulae(drm);
+	struct drm_gpu_scheduler *sched = &ndev->scheduler;
 	struct nebulae_file *nfile;
+	int ret;
 
 	nfile = kzalloc(sizeof(*nfile), GFP_KERNEL);
 	if (!nfile)
 		return -ENOMEM;
+
+	ret = drm_sched_entity_init(&nfile->sched_entity,
+				    DRM_SCHED_PRIORITY_NORMAL, &sched, 1,
+				    NULL);
+	if (ret) {
+		kfree(nfile);
+		return ret;
+	}
 
 	nfile->ctx_id = atomic64_inc_return(&ndev->next_ctx_id);
 	atomic64_set(&nfile->submits, 0);
@@ -44,6 +54,7 @@ void nebulae_file_postclose(struct drm_device *drm, struct drm_file *file)
 		return;
 
 	file->driver_priv = NULL;
+	drm_sched_entity_destroy(&nfile->sched_entity);
 	atomic64_dec(&ndev->open_contexts);
 	kfree(nfile);
 }

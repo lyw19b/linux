@@ -140,6 +140,8 @@ static int nebulae_debugfs_submit(struct seq_file *m, void *data)
 		   atomic64_read(&ndev->finished_jobs));
 	seq_printf(m, "failed_jobs: %lld\n",
 		   atomic64_read(&ndev->failed_jobs));
+	seq_printf(m, "signaled_fences: %lld\n",
+		   atomic64_read(&ndev->signaled_fences));
 	seq_printf(m, "irq_count: %lld\n", atomic64_read(&ndev->irq_count));
 	seq_printf(m, "complete_irq_count: %lld\n",
 		   atomic64_read(&ndev->complete_irq_count));
@@ -149,6 +151,11 @@ static int nebulae_debugfs_submit(struct seq_file *m, void *data)
 		   atomic64_read(&ndev->display_irq_count));
 	seq_printf(m, "display_flips: %lld\n",
 		   atomic64_read(&ndev->display_flips));
+	seq_printf(m, "last_submit_cookie: %llu\n",
+		   ndev->last_submit_cookie);
+	seq_printf(m, "last_submit_pt_base: 0x%llx\n",
+		   ndev->last_submit_pt_base);
+	seq_printf(m, "last_submit_asid: %u\n", ndev->last_submit_asid);
 	seq_printf(m, "last_irq_status: 0x%08x\n", ndev->last_irq_status);
 	seq_printf(m, "last_display_irq_status: 0x%08x\n",
 		   ndev->last_display_irq_status);

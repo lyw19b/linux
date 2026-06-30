@@ -5,10 +5,12 @@
 #include <linux/atomic.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
+#include <linux/kref.h>
 #include <linux/list.h>
 #include <linux/mutex.h>
 #include <linux/platform_device.h>
 #include <linux/sizes.h>
+#include <linux/spinlock.h>
 
 #include <drm/drm_connector.h>
 #include <drm/drm_device.h>
@@ -18,6 +20,7 @@
 #include <drm/drm_gem_shmem_helper.h>
 #include <drm/drm_mm.h>
 #include <drm/drm_simple_kms_helper.h>
+#include <drm/gpu_scheduler.h>
 
 #include <uapi/drm/nebulae_drm.h>
 
@@ -37,6 +40,7 @@
 struct nebulae_file {
 	u64 ctx_id;
 	atomic64_t submits;
+	struct drm_sched_entity sched_entity;
 };
 
 struct nebulae_device {
@@ -55,12 +59,17 @@ struct nebulae_device {
 	int irq;
 	struct mutex bo_lock;
 	struct mutex submit_lock;
+	spinlock_t fence_lock;
+	struct drm_gpu_scheduler scheduler;
 	struct list_head bo_list;
 	struct drm_mm va_mm;
 	u64 next_va;
+	u64 fence_context;
 	bool sysfs_registered;
 	atomic64_t submitted_jobs;
 	atomic64_t completed_jobs;
+	atomic64_t fence_seqno;
+	atomic64_t signaled_fences;
 	atomic64_t next_ctx_id;
 	atomic64_t open_contexts;
 	atomic64_t scheduled_jobs;
@@ -72,6 +81,9 @@ struct nebulae_device {
 	atomic64_t fault_irq_count;
 	atomic64_t display_irq_count;
 	atomic64_t display_flips;
+	u64 last_submit_cookie;
+	u64 last_submit_pt_base;
+	u32 last_submit_asid;
 	u32 last_irq_status;
 	u32 last_display_irq_status;
 };
@@ -83,6 +95,23 @@ struct nebulae_bo {
 	u64 va;
 	u32 flags;
 	bool listed;
+};
+
+struct nebulae_job {
+	struct drm_sched_job base;
+	struct kref refcount;
+	struct nebulae_device *ndev;
+	struct drm_gem_object *cmd_obj;
+	struct nebulae_bo *cmd_bo;
+	u32 offset;
+	u32 size;
+	u32 cmd_count;
+	u32 asid;
+	u64 pt_base;
+	u64 cookie;
+	u64 hw_seq;
+	u32 hw_status;
+	int result;
 };
 
 static inline struct nebulae_device *to_nebulae(struct drm_device *drm)
@@ -144,6 +173,7 @@ int nebulae_sched_init(struct nebulae_device *ndev);
 void nebulae_sched_fini(struct nebulae_device *ndev);
 void nebulae_sched_record_submit(struct nebulae_device *ndev);
 void nebulae_sched_record_complete(struct nebulae_device *ndev, int ret);
+extern const struct drm_sched_backend_ops nebulae_sched_ops;
 
 int nebulae_ioctl_submit(struct drm_device *drm, void *data,
 			 struct drm_file *file);
