@@ -201,6 +201,12 @@ int nebulae_device_probe(struct platform_device *pdev)
 	WRITE_ONCE(ndev->last_error, readl(ndev->regs + NEB_REG_LAST_ERROR));
 	atomic64_set(&ndev->submitted_jobs, 0);
 	atomic64_set(&ndev->completed_jobs, 0);
+	atomic64_set(&ndev->irq_count, 0);
+	atomic64_set(&ndev->complete_irq_count, 0);
+	atomic64_set(&ndev->fault_irq_count, 0);
+	atomic64_set(&ndev->display_irq_count, 0);
+	ndev->last_irq_status = 0;
+	ndev->last_display_irq_status = 0;
 
 	ret = nebulae_ctx_init(ndev);
 	if (ret)
@@ -213,7 +219,11 @@ int nebulae_device_probe(struct platform_device *pdev)
 	ndev->irq = platform_get_irq_optional(pdev, 0);
 	if (ndev->irq > 0) {
 		writel(NEB_IRQ_ALL, ndev->regs + NEB_REG_IRQ_STATUS);
+		writel(NEB_DISPLAY_IRQ_FLIP_DONE,
+		       ndev->regs + NEB_REG_DISPLAY_IRQ_STATUS);
 		writel(NEB_IRQ_ALL, ndev->regs + NEB_REG_IRQ_MASK);
+		writel(NEB_DISPLAY_IRQ_FLIP_DONE,
+		       ndev->regs + NEB_REG_DISPLAY_IRQ_MASK);
 		ret = devm_request_irq(dev, ndev->irq, nebulae_irq, 0,
 				       dev_name(dev), ndev);
 		if (ret)
@@ -259,8 +269,10 @@ void nebulae_device_remove(struct platform_device *pdev)
 	nebulae_sysfs_fini(ndev);
 	drm_dev_unregister(drm);
 	drm_atomic_helper_shutdown(drm);
-	if (ndev->regs)
+	if (ndev->regs) {
 		writel(0, ndev->regs + NEB_REG_IRQ_MASK);
+		writel(0, ndev->regs + NEB_REG_DISPLAY_IRQ_MASK);
+	}
 	nebulae_sched_fini(ndev);
 	nebulae_ctx_fini(ndev);
 	nebulae_vm_fini(ndev);

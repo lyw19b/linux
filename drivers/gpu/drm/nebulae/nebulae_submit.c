@@ -100,6 +100,7 @@ int nebulae_ioctl_submit_cmd_bo(struct drm_device *drm, void *data,
 				struct drm_file *file)
 {
 	struct nebulae_device *ndev = to_nebulae(drm);
+	struct nebulae_file *nfile = file->driver_priv;
 	struct drm_nebulae_submit_cmd_bo *args = data;
 	struct drm_gem_object *obj;
 	struct nebulae_bo *bo;
@@ -107,7 +108,7 @@ int nebulae_ioctl_submit_cmd_bo(struct drm_device *drm, void *data,
 				DRM_NEBULAE_SUBMIT_IN_FENCE_FD |
 				DRM_NEBULAE_SUBMIT_OUT_FENCE_FD;
 	u32 hw_status = 0;
-	u64 seq;
+	u64 seq = 0;
 	int ret;
 
 	if (args->flags & unsupported_flags)
@@ -121,22 +122,29 @@ int nebulae_ioctl_submit_cmd_bo(struct drm_device *drm, void *data,
 
 	if ((u64)args->offset + args->size > obj->size) {
 		ret = -EINVAL;
+		args->driver_error = ret;
 		goto out_put;
 	}
 
 	bo = to_nebulae_bo(obj);
+	if (nfile)
+		atomic64_inc(&nfile->submits);
+	nebulae_sched_record_submit(ndev);
 
 	ret = nebulae_sync_all_bos_to_vram(ndev);
 	if (ret)
-		goto out_put;
+		goto out_complete;
 
 	ret = nebulae_hw_submit_cmd_bo(ndev, bo, args->offset, args->size,
 				       args->cmd_count, &seq, &hw_status);
 	if (!ret)
 		ret = nebulae_sync_all_bos_from_vram(ndev);
+
+out_complete:
 	args->seq = seq;
 	args->status = hw_status;
 	args->driver_error = ret;
+	nebulae_sched_record_complete(ndev, ret);
 
 out_put:
 	drm_gem_object_put(obj);

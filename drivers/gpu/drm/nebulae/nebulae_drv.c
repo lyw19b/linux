@@ -44,6 +44,8 @@ const struct drm_driver nebulae_drm_driver = {
 			   DRIVER_ATOMIC | DRIVER_SYNCOBJ |
 			   DRIVER_SYNCOBJ_TIMELINE,
 	DRM_GEM_SHMEM_DRIVER_OPS,
+	.open = nebulae_file_open,
+	.postclose = nebulae_file_postclose,
 	.gem_create_object = nebulae_gem_create_object,
 	.ioctls = nebulae_ioctls,
 	.num_ioctls = ARRAY_SIZE(nebulae_ioctls),

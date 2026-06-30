@@ -11,5 +11,11 @@
 
 int nebulae_vblank_init(struct nebulae_device *ndev)
 {
+	atomic64_set(&ndev->display_flips, 0);
 	return 0;
+}
+
+void nebulae_vblank_record_flip(struct nebulae_device *ndev)
+{
+	atomic64_inc(&ndev->display_flips);
 }

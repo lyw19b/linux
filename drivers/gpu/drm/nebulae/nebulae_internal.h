@@ -16,6 +16,7 @@
 #include <drm/drm_framebuffer.h>
 #include <drm/drm_gem.h>
 #include <drm/drm_gem_shmem_helper.h>
+#include <drm/drm_mm.h>
 #include <drm/drm_simple_kms_helper.h>
 
 #include <uapi/drm/nebulae_drm.h>
@@ -32,6 +33,11 @@
 #define NEB_KMS_PREFERRED_HEIGHT	768
 #define NEB_KMS_MAX_WIDTH		1920
 #define NEB_KMS_MAX_HEIGHT		1080
+
+struct nebulae_file {
+	u64 ctx_id;
+	atomic64_t submits;
+};
 
 struct nebulae_device {
 	struct drm_device drm;
@@ -50,14 +56,30 @@ struct nebulae_device {
 	struct mutex bo_lock;
 	struct mutex submit_lock;
 	struct list_head bo_list;
+	struct drm_mm va_mm;
 	u64 next_va;
+	bool sysfs_registered;
 	atomic64_t submitted_jobs;
 	atomic64_t completed_jobs;
+	atomic64_t next_ctx_id;
+	atomic64_t open_contexts;
+	atomic64_t scheduled_jobs;
+	atomic64_t running_jobs;
+	atomic64_t finished_jobs;
+	atomic64_t failed_jobs;
+	atomic64_t irq_count;
+	atomic64_t complete_irq_count;
+	atomic64_t fault_irq_count;
+	atomic64_t display_irq_count;
+	atomic64_t display_flips;
+	u32 last_irq_status;
+	u32 last_display_irq_status;
 };
 
 struct nebulae_bo {
 	struct drm_gem_shmem_object base;
 	struct list_head link;
+	struct drm_mm_node va_node;
 	u64 va;
 	u32 flags;
 	bool listed;
@@ -111,12 +133,17 @@ int nebulae_vm_init(struct nebulae_device *ndev);
 void nebulae_vm_fini(struct nebulae_device *ndev);
 int nebulae_alloc_bo_va(struct nebulae_device *ndev, struct nebulae_bo *bo,
 			u64 size);
+void nebulae_free_bo_va(struct nebulae_device *ndev, struct nebulae_bo *bo);
 
 int nebulae_ctx_init(struct nebulae_device *ndev);
 void nebulae_ctx_fini(struct nebulae_device *ndev);
+int nebulae_file_open(struct drm_device *drm, struct drm_file *file);
+void nebulae_file_postclose(struct drm_device *drm, struct drm_file *file);
 
 int nebulae_sched_init(struct nebulae_device *ndev);
 void nebulae_sched_fini(struct nebulae_device *ndev);
+void nebulae_sched_record_submit(struct nebulae_device *ndev);
+void nebulae_sched_record_complete(struct nebulae_device *ndev, int ret);
 
 int nebulae_ioctl_submit(struct drm_device *drm, void *data,
 			 struct drm_file *file);
@@ -153,6 +180,7 @@ void nebulae_plane_disable(struct drm_simple_display_pipe *pipe);
 void nebulae_plane_update(struct drm_simple_display_pipe *pipe,
 			  struct drm_plane_state *old_plane_state);
 int nebulae_vblank_init(struct nebulae_device *ndev);
+void nebulae_vblank_record_flip(struct nebulae_device *ndev);
 
 void nebulae_debugfs_init(struct drm_minor *minor);
 int nebulae_sysfs_init(struct nebulae_device *ndev);

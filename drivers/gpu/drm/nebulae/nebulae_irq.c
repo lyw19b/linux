@@ -12,15 +12,37 @@ irqreturn_t nebulae_irq(int irq, void *data)
 {
 	struct nebulae_device *ndev = data;
 	u32 status;
+	u32 display_status;
 
 	status = readl(ndev->regs + NEB_REG_IRQ_STATUS);
-	if (!status)
+	display_status = readl(ndev->regs + NEB_REG_DISPLAY_IRQ_STATUS);
+	if (!status && !display_status)
 		return IRQ_NONE;
 
-	writel(status, ndev->regs + NEB_REG_IRQ_STATUS);
-	WRITE_ONCE(ndev->last_error, readl(ndev->regs + NEB_REG_LAST_ERROR));
-	atomic64_set(&ndev->completed_jobs,
-		     neb_readq(ndev, NEB_REG_COMPLETED_SEQ_LO));
+	if (status)
+		writel(status, ndev->regs + NEB_REG_IRQ_STATUS);
+	if (display_status)
+		writel(display_status, ndev->regs + NEB_REG_DISPLAY_IRQ_STATUS);
+
+	ndev->last_irq_status = status;
+	ndev->last_display_irq_status = display_status;
+	atomic64_inc(&ndev->irq_count);
+
+	if (status & NEB_IRQ_COMPLETE) {
+		atomic64_inc(&ndev->complete_irq_count);
+		atomic64_set(&ndev->completed_jobs,
+			     neb_readq(ndev, NEB_REG_COMPLETED_SEQ_LO));
+	}
+
+	if (status & NEB_IRQ_FAULT) {
+		atomic64_inc(&ndev->fault_irq_count);
+		WRITE_ONCE(ndev->last_error,
+			   readl(ndev->regs + NEB_REG_LAST_ERROR));
+	}
+
+	if ((status & NEB_IRQ_DISPLAY) ||
+	    (display_status & NEB_DISPLAY_IRQ_FLIP_DONE))
+		atomic64_inc(&ndev->display_irq_count);
 
 	return IRQ_HANDLED;
 }

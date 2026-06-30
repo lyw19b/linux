@@ -39,6 +39,7 @@ static void nebulae_program_display(struct nebulae_device *ndev,
 	writel((u32)scanout_size, ndev->regs + NEB_REG_DISPLAY_FB_SIZE);
 	writel(1, ndev->regs + NEB_REG_DISPLAY_ENABLE);
 	writel(1, ndev->regs + NEB_REG_DISPLAY_FLIP);
+	nebulae_vblank_record_flip(ndev);
 }
 
 static void nebulae_kms_update_scanout(struct nebulae_device *ndev,

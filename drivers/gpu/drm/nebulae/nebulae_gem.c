@@ -47,6 +47,7 @@ static void nebulae_gem_object_free(struct drm_gem_object *obj)
 	}
 	mutex_unlock(&ndev->bo_lock);
 
+	nebulae_free_bo_va(ndev, bo);
 	drm_gem_shmem_object_free(obj);
 }
 
