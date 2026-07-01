@@ -3,6 +3,7 @@
  * Nebulae GEM/BO management.
  */
 
+#include <linux/dma-resv.h>
 #include <linux/err.h>
 #include <linux/errno.h>
 #include <linux/io.h>
@@ -18,8 +19,8 @@
 
 static const struct drm_gem_object_funcs nebulae_gem_object_funcs;
 
-struct drm_gem_object *nebulae_gem_create_object(struct drm_device *drm,
-						 size_t size)
+struct drm_gem_object *nebulae_gpu_gem_create_object(struct drm_device *drm,
+						     size_t size)
 {
 	struct nebulae_bo *bo;
 
@@ -74,16 +75,28 @@ static int nebulae_bo_sync_to_vram(struct nebulae_device *ndev,
 	    obj->size > ndev->vram_size - bo->va)
 		return -EINVAL;
 
-	ret = drm_gem_shmem_vmap(&bo->base, &map);
+	/* drm_gem_shmem_vmap/vunmap assert the reservation lock is held and
+	 * mutate pages_use_count; without it they race the KMS shadow-blit and
+	 * shrinker paths, freeing shmem->pages under us (NULL deref in
+	 * drm_gem_put_pages). */
+	ret = dma_resv_lock(obj->resv, NULL);
 	if (ret)
 		return ret;
+
+	ret = drm_gem_shmem_vmap(&bo->base, &map);
+	if (ret) {
+		dma_resv_unlock(obj->resv);
+		return ret;
+	}
 	if (map.is_iomem) {
 		drm_gem_shmem_vunmap(&bo->base, &map);
+		dma_resv_unlock(obj->resv);
 		return -EINVAL;
 	}
 
 	memcpy_toio(ndev->vram + bo->va, map.vaddr, obj->size);
 	drm_gem_shmem_vunmap(&bo->base, &map);
+	dma_resv_unlock(obj->resv);
 	return 0;
 }
 
@@ -98,16 +111,26 @@ static int nebulae_bo_sync_from_vram(struct nebulae_device *ndev,
 	    obj->size > ndev->vram_size - bo->va)
 		return -EINVAL;
 
-	ret = drm_gem_shmem_vmap(&bo->base, &map);
+	/* See nebulae_bo_sync_to_vram: the reservation lock is required around
+	 * drm_gem_shmem_vmap/vunmap to avoid racing page teardown. */
+	ret = dma_resv_lock(obj->resv, NULL);
 	if (ret)
 		return ret;
+
+	ret = drm_gem_shmem_vmap(&bo->base, &map);
+	if (ret) {
+		dma_resv_unlock(obj->resv);
+		return ret;
+	}
 	if (map.is_iomem) {
 		drm_gem_shmem_vunmap(&bo->base, &map);
+		dma_resv_unlock(obj->resv);
 		return -EINVAL;
 	}
 
 	memcpy_fromio(map.vaddr, ndev->vram + bo->va, obj->size);
 	drm_gem_shmem_vunmap(&bo->base, &map);
+	dma_resv_unlock(obj->resv);
 	return 0;
 }
 
