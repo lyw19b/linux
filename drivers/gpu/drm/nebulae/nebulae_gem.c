@@ -383,6 +383,14 @@ int nebulae_ioctl_vm_bind(struct drm_device *drm, void *data,
 	else
 		ret = nebulae_mmu_map(ndev, nfile, bo->va, obj->size);
 
+	/* Diagnostic: confirm the VM_BIND prime path maps imported BOs into the
+	 * per-ASID page table.  info-level so it reaches console=ttyS0. */
+	drm_info(drm,
+		 "VM_BIND: op=%s handle=%u va=0x%llx size=%zu asid=%u imported=%d ret=%d\n",
+		 args->op == DRM_NEBULAE_VM_BIND_OP_UNMAP ? "unmap" : "map",
+		 args->handle, bo->va, obj->size, nfile->asid,
+		 obj->import_attach != NULL, ret);
+
 	drm_gem_object_put(obj);
 	return ret;
 }
