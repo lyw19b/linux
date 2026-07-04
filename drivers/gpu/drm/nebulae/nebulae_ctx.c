@@ -41,7 +41,7 @@ int nebulae_file_open(struct drm_device *drm, struct drm_file *file)
 	/* Give this client its own ASID + page table.  If the ASID pool is
 	 * exhausted, fall back to the flat/compat address space (ASID 0, no
 	 * PTBR) so the open still succeeds. */
-	if (nebulae_mmu_ctx_alloc(ndev, &nfile->asid, &nfile->mmu_root)) {
+	if (nebulae_mmu_ctx_alloc(ndev, nfile)) {
 		nfile->asid = 0;
 		nfile->mmu_root = 0;
 	}

@@ -46,6 +46,8 @@ struct nebulae_file {
 	u64 ctx_id;
 	u32 asid;		/* GPU address-space id for this client */
 	u64 mmu_root;		/* this client's page-table root (CSR.PTBR) */
+	u64 mmu_slot_base;	/* base of this client's PT slot in VRAM */
+	u64 mmu_bump;		/* next-free offset for PT tables in the slot */
 	atomic64_t submits;
 	struct drm_sched_entity sched_entity;
 };
@@ -187,8 +189,11 @@ void nebulae_vm_fini(struct nebulae_device *ndev);
 
 int nebulae_mmu_init(struct nebulae_device *ndev);
 void nebulae_mmu_fini(struct nebulae_device *ndev);
-int nebulae_mmu_ctx_alloc(struct nebulae_device *ndev, u32 *asid, u64 *ptbr);
+int nebulae_mmu_ctx_alloc(struct nebulae_device *ndev,
+			  struct nebulae_file *nfile);
 void nebulae_mmu_ctx_free(struct nebulae_device *ndev, u32 asid);
+int nebulae_mmu_map(struct nebulae_device *ndev, struct nebulae_file *nfile,
+		    u64 va, u64 size);
 int nebulae_alloc_bo_va(struct nebulae_device *ndev, struct nebulae_bo *bo,
 			u64 size);
 void nebulae_free_bo_va(struct nebulae_device *ndev, struct nebulae_bo *bo);

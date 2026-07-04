@@ -111,33 +111,30 @@ static int neb_mmu_slot_alloc_table(struct nebulae_device *ndev, u64 slot_base,
 }
 
 /*
- * Build a full identity map of [0, @identity_end) into a fresh three-level tree
- * inside the context PT slot at @slot_base.  Guest pages are 4 KiB but GPU
- * pages are 16 KiB, and graphics waves touch scratch / implicit regions with no
- * backing BO; a full identity map guarantees every access resolves while still
- * exercising the real three-level walk.  (A future sparse mode would populate
- * leaves per bound BO instead; the walk and PTE format are unchanged.)
+ * Identity-map [va, va+size) into the three-level tree rooted at @root,
+ * allocating intermediate L1/L0 tables on demand from the context PT slot
+ * (bump within [slot_base, slot_base + NEB_MMU_CTX_PT_BYTES)).  va/size are
+ * rounded out to the 16 KiB GPU page.  Leaf PTEs map each GPU VA to the same
+ * VRAM offset (identity), so a client sees its own bound VAs and nothing else.
  */
-static int neb_mmu_build_identity(struct nebulae_device *ndev, u64 slot_base,
-				  u64 identity_end, u64 *root_out)
+static int neb_mmu_map_range(struct nebulae_device *ndev, u64 root,
+			     u64 slot_base, u64 *bump, u64 va, u64 size)
 {
-	u64 bump = slot_base;
-	u64 root, va;
+	u64 end = ALIGN(va + size, NEB_MMU_PAGE_SIZE);
 	int ret;
 
-	ret = neb_mmu_slot_alloc_table(ndev, slot_base, &bump, NEB_MMU_L2_SIZE,
-				       &root);
-	if (ret)
-		return ret;
+	va = ALIGN_DOWN(va, NEB_MMU_PAGE_SIZE);
+	if (end > NEB_MMU_VA_MASK)
+		return -EINVAL;
 
-	for (va = 0; va < identity_end; va += NEB_MMU_PAGE_SIZE) {
+	for (; va < end; va += NEB_MMU_PAGE_SIZE) {
 		u64 pte, l1, l0;
 
 		pte = neb_mmu_read_pte(ndev, root, neb_mmu_l2_index(va));
 		if (pte & NEB_MMU_PTE_VALID) {
 			l1 = pte & NEB_MMU_PTE_ADDR_MASK;
 		} else {
-			ret = neb_mmu_slot_alloc_table(ndev, slot_base, &bump,
+			ret = neb_mmu_slot_alloc_table(ndev, slot_base, bump,
 						       NEB_MMU_L1_SIZE, &l1);
 			if (ret)
 				return ret;
@@ -149,7 +146,7 @@ static int neb_mmu_build_identity(struct nebulae_device *ndev, u64 slot_base,
 		if (pte & NEB_MMU_PTE_VALID) {
 			l0 = pte & NEB_MMU_PTE_ADDR_MASK;
 		} else {
-			ret = neb_mmu_slot_alloc_table(ndev, slot_base, &bump,
+			ret = neb_mmu_slot_alloc_table(ndev, slot_base, bump,
 						       NEB_MMU_L0_SIZE, &l0);
 			if (ret)
 				return ret;
@@ -162,7 +159,6 @@ static int neb_mmu_build_identity(struct nebulae_device *ndev, u64 slot_base,
 					  NEB_MMU_PTE_LEAF_DEFAULT);
 	}
 
-	*root_out = root;
 	return 0;
 }
 
@@ -204,14 +200,18 @@ void nebulae_mmu_fini(struct nebulae_device *ndev)
 }
 
 /*
- * Allocate an ASID + its own page table for a drawing client (DRM file).  The
- * page table identity-maps the addressable VRAM below the PT pool.  On success
- * *@asid is 1..NEB_MMU_MAX_CTX and *@ptbr is the root physical base for
- * CSR.PTBR / QueueDescriptor.page_table_root_pa.
+ * Allocate an ASID + its own (initially near-empty) page table for a drawing
+ * client (DRM file).  The table maps only the shared low region [0,
+ * NEB_SCANOUT_RESERVED) -- display framebuffer, scratch and implicit device
+ * regions that every client's waves may touch -- so those never fault under the
+ * otherwise sparse address space.  The client's BOs, allocated above that in
+ * the VA range, are mapped per-client on bind (nebulae_mmu_map), so one client
+ * cannot reach another client's BOs: cross-context access faults.  Populates
+ * nfile->{asid, mmu_root (== CSR.PTBR), mmu_slot_base, mmu_bump}.
  */
-int nebulae_mmu_ctx_alloc(struct nebulae_device *ndev, u32 *asid, u64 *ptbr)
+int nebulae_mmu_ctx_alloc(struct nebulae_device *ndev, struct nebulae_file *nfile)
 {
-	u64 slot_base, root;
+	u64 slot_base, bump, root;
 	int slot, ret;
 
 	mutex_lock(&ndev->mmu_lock);
@@ -222,19 +222,44 @@ int nebulae_mmu_ctx_alloc(struct nebulae_device *ndev, u32 *asid, u64 *ptbr)
 	}
 
 	slot_base = ndev->mmu_pool_base + (u64)slot * NEB_MMU_CTX_PT_BYTES;
-	ret = neb_mmu_build_identity(ndev, slot_base, ndev->mmu_pool_base,
-				     &root);
-	if (ret) { 
+	bump = slot_base;
+	ret = neb_mmu_slot_alloc_table(ndev, slot_base, &bump, NEB_MMU_L2_SIZE,
+				       &root);
+	if (!ret)
+		ret = neb_mmu_map_range(ndev, root, slot_base, &bump, 0,
+					NEB_SCANOUT_RESERVED);
+	if (ret) {
 		mutex_unlock(&ndev->mmu_lock);
 		return ret;
 	}
 
 	__set_bit(slot, ndev->mmu_ctx_bitmap);
+	nfile->asid = (u32)slot + 1;	/* ASID 0 reserved for flat/no-VM */
+	nfile->mmu_root = root;
+	nfile->mmu_slot_base = slot_base;
+	nfile->mmu_bump = bump;
 	mutex_unlock(&ndev->mmu_lock);
-
-	*asid = (u32)slot + 1;		/* ASID 0 reserved for flat/no-VM */
-	*ptbr = root;
 	return 0;
+}
+
+/* Map a bound BO's VA range into this client's address space (identity). */
+int nebulae_mmu_map(struct nebulae_device *ndev, struct nebulae_file *nfile,
+		    u64 va, u64 size)
+{
+	int ret;
+
+	if (!nfile->asid || !nfile->mmu_root)	/* flat/no-VM client */
+		return 0;
+
+	mutex_lock(&ndev->mmu_lock);
+	ret = neb_mmu_map_range(ndev, nfile->mmu_root, nfile->mmu_slot_base,
+				&nfile->mmu_bump, va, size);
+	mutex_unlock(&ndev->mmu_lock);
+	if (ret)
+		drm_warn(&ndev->drm,
+			 "MMU: asid=%u map va=0x%llx size=0x%llx failed: %d (PT slot full?)\n",
+			 nfile->asid, va, size, ret);
+	return ret;
 }
 
 void nebulae_mmu_ctx_free(struct nebulae_device *ndev, u32 asid)

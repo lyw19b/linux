@@ -322,6 +322,15 @@ int nebulae_ioctl_bo_create(struct drm_device *drm, void *data,
 		return ret;
 	}
 
+	/* Map this BO into the creating client's own address space, so its waves
+	 * can reach it and other clients (with different page tables) cannot. */
+	ret = nebulae_mmu_map(ndev, file->driver_priv, bo->va, size);
+	if (ret) {
+		nebulae_free_bo_va(ndev, bo);
+		drm_gem_object_put(&shmem->base);
+		return ret;
+	}
+
 	mutex_lock(&ndev->bo_lock);
 	if (!bo->listed) {
 		list_add_tail(&bo->link, &ndev->bo_list);
