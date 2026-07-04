@@ -7,6 +7,7 @@ nebulae-y := \
 	nebulae_device.o \
 	nebulae_gem.o \
 	nebulae_vm.o \
+	nebulae_mmu.o \
 	nebulae_ctx.o \
 	nebulae_sched.o \
 	nebulae_submit.o \

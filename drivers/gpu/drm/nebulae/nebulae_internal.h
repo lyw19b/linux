@@ -3,6 +3,7 @@
 #define NEBULAE_INTERNAL_H
 
 #include <linux/atomic.h>
+#include <linux/bitmap.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/kref.h>
@@ -37,8 +38,14 @@
 #define NEB_KMS_MAX_WIDTH		1920
 #define NEB_KMS_MAX_HEIGHT		1080
 
+/* Number of GPU address spaces (ASIDs / per-client page tables) the driver
+ * manages; ASID 0 is reserved for flat/no-VM, usable ASIDs are 1..this. */
+#define NEB_MMU_MAX_CTX			16
+
 struct nebulae_file {
 	u64 ctx_id;
+	u32 asid;		/* GPU address-space id for this client */
+	u64 mmu_root;		/* this client's page-table root (CSR.PTBR) */
 	atomic64_t submits;
 	struct drm_sched_entity sched_entity;
 };
@@ -50,6 +57,7 @@ struct nebulae_device {
 	struct drm_connector connector;
 	void __iomem *regs;
 	void __iomem *vram;
+	phys_addr_t vram_phys;	/* physical base of the VRAM window (for BO mmap) */
 	u64 vram_size;
 	u64 vm_start;
 	u64 vm_size;
@@ -64,6 +72,13 @@ struct nebulae_device {
 	struct list_head bo_list;
 	struct drm_mm va_mm;
 	u64 next_va;
+	/* GPU MMU: a pool of per-ASID three-level page tables in VRAM, one page
+	 * table per drawing client / DRM file (see nebulae_mmu.c). */
+	struct mutex mmu_lock;
+	struct drm_mm_node mmu_pt_node;	/* PT pool reserved in va_mm */
+	u64 mmu_pool_base;
+	u64 mmu_pool_size;
+	DECLARE_BITMAP(mmu_ctx_bitmap, NEB_MMU_MAX_CTX);	/* allocated ASIDs */
 	u64 fence_context;
 	bool sysfs_registered;
 	atomic64_t submitted_jobs;
@@ -169,6 +184,11 @@ int nebulae_bo_sync_from_vram(struct nebulae_device *ndev,
 
 int nebulae_vm_init(struct nebulae_device *ndev);
 void nebulae_vm_fini(struct nebulae_device *ndev);
+
+int nebulae_mmu_init(struct nebulae_device *ndev);
+void nebulae_mmu_fini(struct nebulae_device *ndev);
+int nebulae_mmu_ctx_alloc(struct nebulae_device *ndev, u32 *asid, u64 *ptbr);
+void nebulae_mmu_ctx_free(struct nebulae_device *ndev, u32 asid);
 int nebulae_alloc_bo_va(struct nebulae_device *ndev, struct nebulae_bo *bo,
 			u64 size);
 void nebulae_free_bo_va(struct nebulae_device *ndev, struct nebulae_bo *bo);

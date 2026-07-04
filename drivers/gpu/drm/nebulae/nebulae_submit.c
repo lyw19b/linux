@@ -355,7 +355,7 @@ static int nebulae_submit_cmd_bo_direct(struct nebulae_device *ndev,
 	if (!ret)
 		ret = nebulae_hw_submit_cmd_bo(ndev, bo, args->offset,
 					       args->size, args->cmd_count,
-					       0, (u32)nfile->ctx_id ?: 1,
+					       nfile->mmu_root, nfile->asid,
 					       cookie, &seq, &status);
 	if (!ret)
 		ret = nebulae_sync_all_bos_from_vram(ndev);
@@ -537,8 +537,8 @@ int nebulae_ioctl_submit_cmd_bo(struct drm_device *drm, void *data,
 	finished = dma_fence_get(&job->base.s_fence->finished);
 	seq = job->base.id;
 	job->cookie = job->base.id;
-	job->asid = (u32)nfile->ctx_id ?: 1;
-	job->pt_base = 0;
+	job->asid = nfile->asid;
+	job->pt_base = nfile->mmu_root;
 
 	ret = nebulae_export_out_fence(file, args, finished);
 	if (ret)

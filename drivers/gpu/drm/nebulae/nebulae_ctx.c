@@ -38,6 +38,13 @@ int nebulae_file_open(struct drm_device *drm, struct drm_file *file)
 	}
 
 	nfile->ctx_id = atomic64_inc_return(&ndev->next_ctx_id);
+	/* Give this client its own ASID + page table.  If the ASID pool is
+	 * exhausted, fall back to the flat/compat address space (ASID 0, no
+	 * PTBR) so the open still succeeds. */
+	if (nebulae_mmu_ctx_alloc(ndev, &nfile->asid, &nfile->mmu_root)) {
+		nfile->asid = 0;
+		nfile->mmu_root = 0;
+	}
 	atomic64_set(&nfile->submits, 0);
 	file->driver_priv = nfile;
 	atomic64_inc(&ndev->open_contexts);
@@ -55,6 +62,8 @@ void nebulae_file_postclose(struct drm_device *drm, struct drm_file *file)
 
 	file->driver_priv = NULL;
 	drm_sched_entity_destroy(&nfile->sched_entity);
+	if (nfile->asid)
+		nebulae_mmu_ctx_free(ndev, nfile->asid);
 	atomic64_dec(&ndev->open_contexts);
 	kfree(nfile);
 }

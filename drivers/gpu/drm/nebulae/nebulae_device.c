@@ -190,6 +190,7 @@ int nebulae_device_probe(struct platform_device *pdev)
 	reported_vram = neb_readq(ndev, NEB_REG_VRAM_SIZE_LO);
 
 	vram_res = platform_get_resource(pdev, IORESOURCE_MEM, 1);
+	ndev->vram_phys = vram_res->start;
 	ndev->vram_size = resource_size(vram_res);
 	if (reported_vram && reported_vram < ndev->vram_size)
 		ndev->vram_size = reported_vram;
@@ -200,6 +201,10 @@ int nebulae_device_probe(struct platform_device *pdev)
 	ret = nebulae_vm_init(ndev);
 	if (ret)
 		return ret;
+
+	ret = nebulae_mmu_init(ndev);
+	if (ret)
+		goto err_vm;
 
 	WRITE_ONCE(ndev->last_error, readl(ndev->regs + NEB_REG_LAST_ERROR));
 	atomic64_set(&ndev->submitted_jobs, 0);
@@ -263,6 +268,7 @@ err_sched:
 err_ctx:
 	nebulae_ctx_fini(ndev);
 err_vm:
+	nebulae_mmu_fini(ndev);
 	nebulae_vm_fini(ndev);
 	return ret;
 }
@@ -281,6 +287,7 @@ void nebulae_device_remove(struct platform_device *pdev)
 	}
 	nebulae_gpu_sched_fini(ndev);
 	nebulae_ctx_fini(ndev);
+	nebulae_mmu_fini(ndev);
 	nebulae_vm_fini(ndev);
 }
 

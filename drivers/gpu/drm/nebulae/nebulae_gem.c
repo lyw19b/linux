@@ -17,6 +17,7 @@
 #include <drm/drm_gem.h>
 #include <drm/drm_gem_shmem_helper.h>
 #include <drm/drm_prime.h>
+#include <drm/drm_vma_manager.h>
 
 #include "nebulae_internal.h"
 
@@ -55,6 +56,52 @@ static void nebulae_gem_object_free(struct drm_gem_object *obj)
 	drm_gem_shmem_object_free(obj);
 }
 
+/* BOs created with the DEVICE_LOCAL placement are resident in the VRAM window;
+ * their CPU mmap maps that window directly (write-combine) so guest writes land
+ * in VRAM (== the simulator RAM after Tier-0 aliasing) with no shmem->VRAM
+ * staging copy. */
+static bool nebulae_bo_vram_mapped(const struct nebulae_bo *bo)
+{
+	return (bo->flags & DRM_NEBULAE_BO_PLACEMENT_MASK) ==
+	       DRM_NEBULAE_BO_PLACEMENT_DEVICE_LOCAL;
+}
+
+static const struct vm_operations_struct nebulae_gem_vram_vm_ops = {
+	.open = drm_gem_vm_open,
+	.close = drm_gem_vm_close,
+};
+
+/* Map a VRAM-resident BO's window straight into userspace, modelled on
+ * drivers/gpu/drm/virtio/virtgpu_vram.c.  bo->va is page-aligned (the VA
+ * allocator hands out PAGE_ALIGN'd nodes from a page-aligned base). */
+static int nebulae_gem_mmap(struct drm_gem_object *obj,
+			    struct vm_area_struct *vma)
+{
+	struct nebulae_device *ndev = to_nebulae(obj->dev);
+	struct nebulae_bo *bo = to_nebulae_bo(obj);
+	unsigned long vm_size = vma->vm_end - vma->vm_start;
+	phys_addr_t phys;
+
+	if (!nebulae_bo_vram_mapped(bo))
+		return drm_gem_shmem_object_mmap(obj, vma);
+
+	if (!bo->va || (bo->va & ~PAGE_MASK))
+		return -EINVAL;
+
+	vma->vm_pgoff -= drm_vma_node_start(&obj->vma_node);
+	if (((u64)vma->vm_pgoff << PAGE_SHIFT) + vm_size > obj->size)
+		return -EINVAL;
+	phys = ndev->vram_phys + bo->va +
+	       ((phys_addr_t)vma->vm_pgoff << PAGE_SHIFT);
+
+	vm_flags_set(vma, VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
+	vma->vm_page_prot = pgprot_writecombine(vm_get_page_prot(vma->vm_flags));
+	vma->vm_ops = &nebulae_gem_vram_vm_ops;
+
+	return io_remap_pfn_range(vma, vma->vm_start, phys >> PAGE_SHIFT,
+				  vm_size, vma->vm_page_prot);
+}
+
 static const struct drm_gem_object_funcs nebulae_gem_object_funcs = {
 	.free = nebulae_gem_object_free,
 	.print_info = drm_gem_shmem_object_print_info,
@@ -63,7 +110,7 @@ static const struct drm_gem_object_funcs nebulae_gem_object_funcs = {
 	.get_sg_table = drm_gem_shmem_object_get_sg_table,
 	.vmap = drm_gem_shmem_object_vmap,
 	.vunmap = drm_gem_shmem_object_vunmap,
-	.mmap = drm_gem_shmem_object_mmap,
+	.mmap = nebulae_gem_mmap,
 	.vm_ops = &drm_gem_shmem_vm_ops,
 };
 
@@ -177,6 +224,11 @@ static bool nebulae_bo_should_sync_to_vram(struct nebulae_bo *bo)
 	if (!bo->listed || !bo->va)
 		return false;
 
+	/* VRAM-mapped BOs are written by the CPU straight into VRAM; their shmem
+	 * is unused, so staging it in would clobber the real contents. */
+	if (nebulae_bo_vram_mapped(bo))
+		return false;
+
 	return !nebulae_bo_gpu_resident(bo) ||
 	       (bo->domain & DRM_NEBULAE_BO_DOMAIN_CPU);
 }
@@ -184,6 +236,9 @@ static bool nebulae_bo_should_sync_to_vram(struct nebulae_bo *bo)
 static bool nebulae_bo_should_sync_from_vram(struct nebulae_bo *bo)
 {
 	if (!bo->listed || !bo->va)
+		return false;
+
+	if (nebulae_bo_vram_mapped(bo))
 		return false;
 
 	return !nebulae_bo_gpu_resident(bo);
