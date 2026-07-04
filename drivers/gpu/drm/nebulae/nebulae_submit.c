@@ -332,6 +332,42 @@ static void nebulae_job_put(struct nebulae_job *job)
 	kref_put(&job->refcount, nebulae_job_release);
 }
 
+static int nebulae_submit_cmd_bo_direct(struct nebulae_device *ndev,
+					struct nebulae_file *nfile,
+					struct drm_nebulae_submit_cmd_bo *args,
+					struct nebulae_bo *bo)
+{
+	u64 seq = 0;
+	u32 status = 0;
+	u64 cookie;
+	int ret;
+
+	/*
+	 * The QEMU simx graphics path completes command submissions
+	 * synchronously.  Avoid queuing the simple no-fence path through the DRM
+	 * scheduler workqueue, otherwise Xorg's Present copy path can build a
+	 * backlog while it is itself waiting for the submitted fence.
+	 */
+	cookie = atomic64_inc_return(&nfile->submits);
+	nebulae_sched_record_submit(ndev);
+
+	ret = nebulae_sync_all_bos_to_vram(ndev);
+	if (!ret)
+		ret = nebulae_hw_submit_cmd_bo(ndev, bo, args->offset,
+					       args->size, args->cmd_count,
+					       0, (u32)nfile->ctx_id ?: 1,
+					       cookie, &seq, &status);
+	if (!ret)
+		ret = nebulae_sync_all_bos_from_vram(ndev);
+
+	nebulae_sched_record_complete(ndev, ret);
+
+	args->seq = seq ?: cookie;
+	args->status = status;
+	args->driver_error = ret;
+	return ret;
+}
+
 static struct dma_fence *nebulae_job_run(struct drm_sched_job *sched_job)
 {
 	struct nebulae_job *job = container_of(sched_job, struct nebulae_job,
@@ -404,7 +440,7 @@ static void nebulae_job_free(struct drm_sched_job *sched_job)
 	nebulae_job_put(job);
 }
 
-const struct drm_sched_backend_ops nebulae_sched_ops = {
+const struct drm_sched_backend_ops nebulae_gpu_sched_ops = {
 	.run_job = nebulae_job_run,
 	.timedout_job = nebulae_job_timedout,
 	.free_job = nebulae_job_free,
@@ -469,6 +505,11 @@ int nebulae_ioctl_submit_cmd_bo(struct drm_device *drm, void *data,
 	}
 
 	bo = to_nebulae_bo(obj);
+
+	if (!args->flags && !args->in_syncobj) {
+		ret = nebulae_submit_cmd_bo_direct(ndev, nfile, args, bo);
+		goto out_put;
+	}
 
 	job = kzalloc(sizeof(*job), GFP_KERNEL);
 	if (!job) {

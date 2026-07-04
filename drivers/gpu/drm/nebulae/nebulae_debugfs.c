@@ -45,6 +45,12 @@ static const struct nebulae_debugfs_reg nebulae_debugfs_regs[] = {
 	NEB_DEBUGFS_REG(NEB_REG_DISPLAY_FLIP),
 	NEB_DEBUGFS_REG(NEB_REG_DISPLAY_IRQ_STATUS),
 	NEB_DEBUGFS_REG(NEB_REG_DISPLAY_IRQ_MASK),
+	NEB_DEBUGFS_REG(NEB_REG_DISPLAY_PLANE_BASE_LO),
+	NEB_DEBUGFS_REG(NEB_REG_DISPLAY_PLANE_BASE_HI),
+	NEB_DEBUGFS_REG(NEB_REG_DISPLAY_PLANE_STRIDE),
+	NEB_DEBUGFS_REG(NEB_REG_DISPLAY_PLANE_FORMAT),
+	NEB_DEBUGFS_REG(NEB_REG_DISPLAY_PLANE_FLAGS),
+	NEB_DEBUGFS_REG(NEB_REG_DISPLAY_PLANE_SIZE),
 };
 
 static struct nebulae_device *nebulae_debugfs_device(struct seq_file *m)
@@ -111,8 +117,9 @@ static int nebulae_debugfs_bos(struct seq_file *m, void *data)
 	list_for_each_entry(bo, &ndev->bo_list, link) {
 		struct drm_gem_object *obj = &bo->base.base;
 
-		seq_printf(m, "bo%u va=0x%llx size=%zu flags=0x%08x listed=%d\n",
-			   count, bo->va, obj->size, bo->flags, bo->listed);
+		seq_printf(m, "bo%u va=0x%llx size=%zu flags=0x%08x domain=0x%08x listed=%d\n",
+			   count, bo->va, obj->size, bo->flags,
+			   bo->domain, bo->listed);
 		total += obj->size;
 		count++;
 	}

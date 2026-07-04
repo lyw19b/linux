@@ -23,7 +23,7 @@ int nebulae_sched_init(struct nebulae_device *ndev)
 	atomic64_set(&ndev->finished_jobs, 0);
 	atomic64_set(&ndev->failed_jobs, 0);
 
-	ret = drm_sched_init(&ndev->scheduler, &nebulae_sched_ops, NULL,
+	ret = drm_sched_init(&ndev->scheduler, &nebulae_gpu_sched_ops, NULL,
 			     DRM_SCHED_PRIORITY_COUNT, 1, 0,
 			     msecs_to_jiffies(NEBULAE_JOB_TIMEOUT_MS),
 			     NULL, NULL, "nebulae-render", ndev->drm.dev);
@@ -33,7 +33,7 @@ int nebulae_sched_init(struct nebulae_device *ndev)
 	return 0;
 }
 
-void nebulae_sched_fini(struct nebulae_device *ndev)
+void nebulae_gpu_sched_fini(struct nebulae_device *ndev)
 {
 	drm_sched_fini(&ndev->scheduler);
 }

@@ -18,6 +18,8 @@
 
 #include "nebulae_internal.h"
 
+#define NEBULAE_GPU_PLATFORM_DRIVER_NAME	"nebulae-gpu"
+
 static const struct drm_ioctl_desc nebulae_ioctls[] = {
 	DRM_IOCTL_DEF_DRV(NEBULAE_GET_PARAM, nebulae_ioctl_get_param,
 			  DRM_RENDER_ALLOW),
@@ -35,17 +37,22 @@ static const struct drm_ioctl_desc nebulae_ioctls[] = {
 			  DRM_RENDER_ALLOW),
 	DRM_IOCTL_DEF_DRV(NEBULAE_SUBMIT_CMD_BO, nebulae_ioctl_submit_cmd_bo,
 			  DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(NEBULAE_BO_INFO, nebulae_ioctl_bo_info,
+			  DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(NEBULAE_BO_SET_DOMAIN, nebulae_ioctl_bo_set_domain,
+			  DRM_RENDER_ALLOW),
 };
 
 DEFINE_DRM_GEM_FOPS(nebulae_fops);
 
-const struct drm_driver nebulae_drm_driver = {
+const struct drm_driver nebulae_gpu_drm_driver = {
 	.driver_features = DRIVER_GEM | DRIVER_RENDER | DRIVER_MODESET |
 			   DRIVER_ATOMIC | DRIVER_SYNCOBJ,
 	DRM_GEM_SHMEM_DRIVER_OPS,
+	.gem_prime_import = nebulae_gem_prime_import,
 	.open = nebulae_file_open,
 	.postclose = nebulae_file_postclose,
-	.gem_create_object = nebulae_gem_create_object,
+	.gem_create_object = nebulae_gpu_gem_create_object,
 	.ioctls = nebulae_ioctls,
 	.num_ioctls = ARRAY_SIZE(nebulae_ioctls),
 	.fops = &nebulae_fops,
@@ -58,7 +65,7 @@ const struct drm_driver nebulae_drm_driver = {
 };
 
 static const struct of_device_id nebulae_of_match[] = {
-	{ .compatible = "nebulae,laxpu-simx-v1" },
+	{ .compatible = "nebulae,laxpu-gpu-simx-v1" },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, nebulae_of_match);
@@ -68,7 +75,7 @@ static struct platform_driver nebulae_platform_driver = {
 	.remove = nebulae_device_remove,
 	.shutdown = nebulae_device_shutdown,
 	.driver = {
-		.name = DRIVER_NAME,
+		.name = NEBULAE_GPU_PLATFORM_DRIVER_NAME,
 		.of_match_table = nebulae_of_match,
 	},
 };

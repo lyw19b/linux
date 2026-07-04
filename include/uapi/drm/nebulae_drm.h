@@ -41,7 +41,7 @@ enum drm_nebulae_param {
 	DRM_NEBULAE_PARAM_SUBMIT_CAPS,
 };
 
-#define DRM_NEBULAE_UAPI_VERSION			1
+#define DRM_NEBULAE_UAPI_VERSION			2
 
 #define DRM_NEBULAE_SUBMIT_CAP_USERPTR_CMD_STREAM	(1ULL << 0)
 #define DRM_NEBULAE_SUBMIT_CAP_CMD_BO			(1ULL << 1)
@@ -50,7 +50,6 @@ enum drm_nebulae_param {
 #define DRM_NEBULAE_SUBMIT_CAP_ASYNC			(1ULL << 4)
 
 #define DRM_NEBULAE_BO_WC				(1U << 0)
-#define DRM_NEBULAE_BO_NO_AUTO_BIND			(1U << 1)
 #define DRM_NEBULAE_BO_PLACEMENT_SHIFT			16
 #define DRM_NEBULAE_BO_PLACEMENT_SHMEM			(1U << DRM_NEBULAE_BO_PLACEMENT_SHIFT)
 #define DRM_NEBULAE_BO_PLACEMENT_DEVICE_LOCAL		(2U << DRM_NEBULAE_BO_PLACEMENT_SHIFT)
@@ -62,9 +61,15 @@ enum drm_nebulae_param {
 #define DRM_NEBULAE_BO_TYPE_RESOURCE			(3U << DRM_NEBULAE_BO_TYPE_SHIFT)
 #define DRM_NEBULAE_BO_TYPE_MASK			(3U << DRM_NEBULAE_BO_TYPE_SHIFT)
 #define DRM_NEBULAE_BO_FLAGS				(DRM_NEBULAE_BO_WC | \
-							 DRM_NEBULAE_BO_NO_AUTO_BIND | \
 							 DRM_NEBULAE_BO_PLACEMENT_MASK | \
 							 DRM_NEBULAE_BO_TYPE_MASK)
+
+#define DRM_NEBULAE_BO_DOMAIN_CPU			(1U << 0)
+#define DRM_NEBULAE_BO_DOMAIN_GPU			(1U << 1)
+#define DRM_NEBULAE_BO_DOMAIN_SCANOUT			(1U << 2)
+#define DRM_NEBULAE_BO_DOMAIN_MASK			(DRM_NEBULAE_BO_DOMAIN_CPU | \
+							 DRM_NEBULAE_BO_DOMAIN_GPU | \
+							 DRM_NEBULAE_BO_DOMAIN_SCANOUT)
 
 #define DRM_NEBULAE_SUBMIT_ASYNC			(1U << 0)
 #define DRM_NEBULAE_SUBMIT_SIGNAL_SYNCOBJ		(1U << 1)
@@ -158,7 +163,31 @@ struct drm_nebulae_madvise {
 #define DRM_NEBULAE_SUBMIT		0x05
 #define DRM_NEBULAE_MADVISE		0x06
 #define DRM_NEBULAE_SUBMIT_CMD_BO	0x07
-#define DRM_NEBULAE_NUM_IOCTLS		0x08
+#define DRM_NEBULAE_BO_INFO		0x08
+#define DRM_NEBULAE_BO_SET_DOMAIN	0x09
+#define DRM_NEBULAE_NUM_IOCTLS		0x0a
+
+/* Query the BO metadata needed by user mode after import.  PRIME import gives
+ * a per-file GEM handle; Mesa still needs the GPU VA, size, placement and
+ * current coherency domain to build descriptors and make scanout decisions. */
+struct drm_nebulae_bo_info {
+	__u32 handle;
+	__u32 flags;
+	__u64 size;
+	__u64 va;
+	__u32 placement;
+	__u32 domain;
+};
+
+/* Request a coherency domain transition for a BO.  read_domains asks the kernel
+ * to make that domain current before returning; write_domain marks the domain
+ * that subsequent writes will authoritatively update. */
+struct drm_nebulae_bo_set_domain {
+	__u32 handle;
+	__u32 read_domains;
+	__u32 write_domain;
+	__u32 pad;
+};
 
 #define DRM_IOCTL_NEBULAE_GET_PARAM \
 	DRM_IOWR(DRM_COMMAND_BASE + DRM_NEBULAE_GET_PARAM, \
@@ -184,6 +213,12 @@ struct drm_nebulae_madvise {
 #define DRM_IOCTL_NEBULAE_SUBMIT_CMD_BO \
 	DRM_IOWR(DRM_COMMAND_BASE + DRM_NEBULAE_SUBMIT_CMD_BO, \
 		 struct drm_nebulae_submit_cmd_bo)
+#define DRM_IOCTL_NEBULAE_BO_INFO \
+	DRM_IOWR(DRM_COMMAND_BASE + DRM_NEBULAE_BO_INFO, \
+		 struct drm_nebulae_bo_info)
+#define DRM_IOCTL_NEBULAE_BO_SET_DOMAIN \
+	DRM_IOWR(DRM_COMMAND_BASE + DRM_NEBULAE_BO_SET_DOMAIN, \
+		 struct drm_nebulae_bo_set_domain)
 
 #if defined(__cplusplus)
 }

@@ -47,5 +47,11 @@ struct drm_framebuffer *nebulae_fb_create(struct drm_device *drm,
 		}
 	}
 
-	return drm_gem_fb_create(drm, file, mode_cmd);
+	/* Install a .dirty callback (drm_atomic_helper_dirtyfb) so that a
+	 * client's drmModeDirtyFB after rendering re-runs the plane atomic
+	 * update -> nebulae_kms_update_scanout, re-blitting the framebuffer
+	 * into the scanout VRAM.  Without this the shadow blit only happens on
+	 * modeset/pageflip, so continuous rendering (e.g. glxgears via the
+	 * modesetting CopyArea/dirty path) never reaches the display. */
+	return drm_gem_fb_create_with_dirty(drm, file, mode_cmd);
 }

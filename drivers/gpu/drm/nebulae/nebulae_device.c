@@ -163,7 +163,7 @@ int nebulae_device_probe(struct platform_device *pdev)
 	u32 magic;
 	int ret;
 
-	ndev = devm_drm_dev_alloc(dev, &nebulae_drm_driver,
+	ndev = devm_drm_dev_alloc(dev, &nebulae_gpu_drm_driver,
 				  struct nebulae_device, drm);
 	if (IS_ERR(ndev))
 		return PTR_ERR(ndev);
@@ -230,7 +230,7 @@ int nebulae_device_probe(struct platform_device *pdev)
 		writel(NEB_IRQ_ALL, ndev->regs + NEB_REG_IRQ_MASK);
 		writel(NEB_DISPLAY_IRQ_FLIP_DONE,
 		       ndev->regs + NEB_REG_DISPLAY_IRQ_MASK);
-		ret = devm_request_irq(dev, ndev->irq, nebulae_irq, 0,
+		ret = devm_request_irq(dev, ndev->irq, nebulae_gpu_irq, 0,
 				       dev_name(dev), ndev);
 		if (ret)
 			goto err_sched;
@@ -244,7 +244,7 @@ int nebulae_device_probe(struct platform_device *pdev)
 	if (ret)
 		goto err_sched;
 
-	ret = nebulae_sysfs_init(ndev);
+	ret = nebulae_gpu_sysfs_init(ndev);
 	if (ret)
 		goto err_unregister;
 
@@ -259,7 +259,7 @@ int nebulae_device_probe(struct platform_device *pdev)
 err_unregister:
 	drm_dev_unregister(drm);
 err_sched:
-	nebulae_sched_fini(ndev);
+	nebulae_gpu_sched_fini(ndev);
 err_ctx:
 	nebulae_ctx_fini(ndev);
 err_vm:
@@ -272,14 +272,14 @@ void nebulae_device_remove(struct platform_device *pdev)
 	struct drm_device *drm = platform_get_drvdata(pdev);
 	struct nebulae_device *ndev = to_nebulae(drm);
 
-	nebulae_sysfs_fini(ndev);
+	nebulae_gpu_sysfs_fini(ndev);
 	drm_dev_unregister(drm);
 	drm_atomic_helper_shutdown(drm);
 	if (ndev->regs) {
 		writel(0, ndev->regs + NEB_REG_IRQ_MASK);
 		writel(0, ndev->regs + NEB_REG_DISPLAY_IRQ_MASK);
 	}
-	nebulae_sched_fini(ndev);
+	nebulae_gpu_sched_fini(ndev);
 	nebulae_ctx_fini(ndev);
 	nebulae_vm_fini(ndev);
 }

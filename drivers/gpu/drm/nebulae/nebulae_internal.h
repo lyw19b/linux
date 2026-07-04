@@ -94,6 +94,7 @@ struct nebulae_bo {
 	struct drm_mm_node va_node;
 	u64 va;
 	u32 flags;
+	u32 domain;
 	bool listed;
 };
 
@@ -139,14 +140,14 @@ static inline void neb_writeq(struct nebulae_device *ndev, u32 lo_reg,
 	writel((u32)(value >> 32), ndev->regs + lo_reg + 4);
 }
 
-extern const struct drm_driver nebulae_drm_driver;
+extern const struct drm_driver nebulae_gpu_drm_driver;
 
 int nebulae_device_probe(struct platform_device *pdev);
 void nebulae_device_remove(struct platform_device *pdev);
 void nebulae_device_shutdown(struct platform_device *pdev);
 
-struct drm_gem_object *nebulae_gem_create_object(struct drm_device *drm,
-						 size_t size);
+struct drm_gem_object *nebulae_gpu_gem_create_object(struct drm_device *drm,
+						     size_t size);
 int nebulae_ioctl_bo_create(struct drm_device *drm, void *data,
 			    struct drm_file *file);
 int nebulae_ioctl_bo_mmap(struct drm_device *drm, void *data,
@@ -155,8 +156,16 @@ int nebulae_ioctl_bo_wait(struct drm_device *drm, void *data,
 			  struct drm_file *file);
 int nebulae_ioctl_madvise(struct drm_device *drm, void *data,
 			  struct drm_file *file);
+int nebulae_ioctl_bo_info(struct drm_device *drm, void *data,
+			  struct drm_file *file);
+int nebulae_ioctl_bo_set_domain(struct drm_device *drm, void *data,
+				struct drm_file *file);
+struct drm_gem_object *nebulae_gem_prime_import(struct drm_device *drm,
+						struct dma_buf *dma_buf);
 int nebulae_sync_all_bos_to_vram(struct nebulae_device *ndev);
 int nebulae_sync_all_bos_from_vram(struct nebulae_device *ndev);
+int nebulae_bo_sync_from_vram(struct nebulae_device *ndev,
+			      struct nebulae_bo *bo);
 
 int nebulae_vm_init(struct nebulae_device *ndev);
 void nebulae_vm_fini(struct nebulae_device *ndev);
@@ -170,17 +179,17 @@ int nebulae_file_open(struct drm_device *drm, struct drm_file *file);
 void nebulae_file_postclose(struct drm_device *drm, struct drm_file *file);
 
 int nebulae_sched_init(struct nebulae_device *ndev);
-void nebulae_sched_fini(struct nebulae_device *ndev);
+void nebulae_gpu_sched_fini(struct nebulae_device *ndev);
 void nebulae_sched_record_submit(struct nebulae_device *ndev);
 void nebulae_sched_record_complete(struct nebulae_device *ndev, int ret);
-extern const struct drm_sched_backend_ops nebulae_sched_ops;
+extern const struct drm_sched_backend_ops nebulae_gpu_sched_ops;
 
 int nebulae_ioctl_submit(struct drm_device *drm, void *data,
 			 struct drm_file *file);
 int nebulae_ioctl_submit_cmd_bo(struct drm_device *drm, void *data,
 				struct drm_file *file);
 
-irqreturn_t nebulae_irq(int irq, void *data);
+irqreturn_t nebulae_gpu_irq(int irq, void *data);
 
 void nebulae_fill_device_info(struct nebulae_device *ndev,
 			      struct drm_nebulae_device_info *info);
@@ -213,7 +222,7 @@ int nebulae_vblank_init(struct nebulae_device *ndev);
 void nebulae_vblank_record_flip(struct nebulae_device *ndev);
 
 void nebulae_debugfs_init(struct drm_minor *minor);
-int nebulae_sysfs_init(struct nebulae_device *ndev);
-void nebulae_sysfs_fini(struct nebulae_device *ndev);
+int nebulae_gpu_sysfs_init(struct nebulae_device *ndev);
+void nebulae_gpu_sysfs_fini(struct nebulae_device *ndev);
 
 #endif /* NEBULAE_INTERNAL_H */

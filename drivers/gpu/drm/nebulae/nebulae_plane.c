@@ -8,6 +8,7 @@
 #include <linux/io.h>
 
 #include <drm/drm_drv.h>
+#include <drm/drm_fourcc.h>
 #include <drm/drm_format_helper.h>
 #include <drm/drm_framebuffer.h>
 #include <drm/drm_gem_atomic_helper.h>
@@ -27,7 +28,10 @@ u64 nebulae_scanout_size(unsigned int width, unsigned int height,
 
 static void nebulae_program_display(struct nebulae_device *ndev,
 				    unsigned int width, unsigned int height,
-				    unsigned int pitch, u64 scanout_size)
+				    unsigned int pitch, u64 scanout_size,
+				    u64 plane_base, unsigned int plane_pitch,
+				    u32 plane_format, u32 plane_flags,
+				    u64 plane_size)
 {
 	writel(0, ndev->regs + NEB_REG_DISPLAY_ENABLE);
 	writel(width, ndev->regs + NEB_REG_DISPLAY_WIDTH);
@@ -37,15 +41,58 @@ static void nebulae_program_display(struct nebulae_device *ndev,
 	       ndev->regs + NEB_REG_DISPLAY_FORMAT);
 	neb_writeq(ndev, NEB_REG_DISPLAY_FB_BASE_LO, 0);
 	writel((u32)scanout_size, ndev->regs + NEB_REG_DISPLAY_FB_SIZE);
+	neb_writeq(ndev, NEB_REG_DISPLAY_PLANE_BASE_LO, plane_base);
+	writel(plane_pitch, ndev->regs + NEB_REG_DISPLAY_PLANE_STRIDE);
+	writel(plane_format, ndev->regs + NEB_REG_DISPLAY_PLANE_FORMAT);
+	writel(plane_flags, ndev->regs + NEB_REG_DISPLAY_PLANE_FLAGS);
+	writel((u32)plane_size, ndev->regs + NEB_REG_DISPLAY_PLANE_SIZE);
 	writel(1, ndev->regs + NEB_REG_DISPLAY_ENABLE);
 	writel(1, ndev->regs + NEB_REG_DISPLAY_FLIP);
 	nebulae_vblank_record_flip(ndev);
+}
+
+static bool nebulae_fb_has_gpu_plane(struct nebulae_bo *bo, u64 offset,
+				     u64 scanout_size)
+{
+	struct drm_gem_object *obj = &bo->base.base;
+
+	return bo->va && offset <= obj->size && scanout_size <= obj->size - offset;
+}
+
+static u32 nebulae_fb_plane_format(const struct drm_framebuffer *fb)
+{
+	switch (fb->format->format) {
+	case DRM_FORMAT_ARGB8888:
+	case DRM_FORMAT_XRGB8888:
+	default:
+		return NEB_DISPLAY_FORMAT_XRGB8888;
+	}
+}
+
+static void nebulae_program_gpu_plane(struct nebulae_device *ndev,
+				      struct drm_framebuffer *fb,
+				      struct nebulae_bo *bo,
+				      unsigned int width, unsigned int height,
+				      u64 scanout_size)
+{
+	u64 offset = fb->offsets[0];
+
+	mutex_lock(&ndev->bo_lock);
+	bo->domain |= DRM_NEBULAE_BO_DOMAIN_SCANOUT;
+	mutex_unlock(&ndev->bo_lock);
+
+	nebulae_program_display(ndev, width, height, fb->pitches[0],
+				 scanout_size, bo->va + offset, fb->pitches[0],
+				 nebulae_fb_plane_format(fb),
+				 NEB_DISPLAY_PLANE_VALID, scanout_size);
 }
 
 static void nebulae_kms_update_scanout(struct nebulae_device *ndev,
 				       struct drm_plane_state *plane_state)
 {
 	struct drm_framebuffer *fb;
+	struct drm_gem_object *obj;
+	struct nebulae_bo *bo;
 	struct iosys_map map[DRM_FORMAT_MAX_PLANES];
 	struct iosys_map data[DRM_FORMAT_MAX_PLANES];
 	struct iosys_map dst = IOSYS_MAP_INIT_VADDR_IOMEM(ndev->vram);
@@ -61,19 +108,33 @@ static void nebulae_kms_update_scanout(struct nebulae_device *ndev,
 		return;
 
 	fb = plane_state->fb;
+	obj = drm_gem_fb_get_obj(fb, 0);
+	if (!obj)
+		return;
+	bo = to_nebulae_bo(obj);
 	width = plane_state->crtc_w ?: fb->width;
 	height = plane_state->crtc_h ?: fb->height;
 	scanout_size = nebulae_scanout_size(width, height, fb->pitches[0]);
 	if (!scanout_size || scanout_size > ndev->vram_size)
 		return;
 
-	ret = drm_gem_fb_begin_cpu_access(fb, DMA_FROM_DEVICE);
-	if (ret)
+	if (nebulae_fb_has_gpu_plane(bo, fb->offsets[0], scanout_size)) {
+		if (!drm_dev_enter(&ndev->drm, &idx))
+			return;
+		nebulae_program_gpu_plane(ndev, fb, bo, width, height,
+					   scanout_size);
+		drm_dev_exit(idx);
 		return;
+	}
 
+	/* The simulated render path completes submissions synchronously.  Waiting
+	 * for implicit framebuffer fences here can deadlock the Xorg dirty path:
+	 * Present waits for DirtyFB to finish, while DirtyFB waits for a dma-buf
+	 * fence that is only retired by the same single-threaded display flow.
+	 * Mapping directly is sufficient for this shadow-blit model. */
 	ret = drm_gem_fb_vmap(fb, map, data);
 	if (ret)
-		goto out_cpu_access;
+		return;
 	if (data[0].is_iomem)
 		goto out_vunmap;
 
@@ -84,14 +145,13 @@ static void nebulae_kms_update_scanout(struct nebulae_device *ndev,
 	clip = DRM_RECT_INIT(0, 0, width, height);
 	drm_fb_memcpy(&dst, dst_pitch, data, fb, &clip);
 	nebulae_program_display(ndev, width, height, fb->pitches[0],
-				 scanout_size);
+				 scanout_size, 0, 0,
+				 NEB_DISPLAY_FORMAT_XRGB8888, 0, 0);
 
 	drm_dev_exit(idx);
 
 out_vunmap:
 	drm_gem_fb_vunmap(fb, map);
-out_cpu_access:
-	drm_gem_fb_end_cpu_access(fb, DMA_FROM_DEVICE);
 }
 
 int nebulae_plane_check(struct drm_simple_display_pipe *pipe,

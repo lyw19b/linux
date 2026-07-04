@@ -6,6 +6,7 @@ config DRM_NEBULAE
 	depends on OF && HAS_IOMEM
 	select DRM_GEM_SHMEM_HELPER
 	select DRM_KMS_HELPER
+	select DRM_SCHED
 	help
 	  DRM graphics/display driver for the Nebulae GPU exposed by the QEMU
 	  LAXPUSOC LoongArch64 machine.

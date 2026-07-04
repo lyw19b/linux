@@ -160,7 +160,7 @@ static const struct attribute_group nebulae_sysfs_attr_group = {
 	.attrs = nebulae_sysfs_attrs,
 };
 
-int nebulae_sysfs_init(struct nebulae_device *ndev)
+int nebulae_gpu_sysfs_init(struct nebulae_device *ndev)
 {
 	int ret;
 
@@ -173,7 +173,7 @@ int nebulae_sysfs_init(struct nebulae_device *ndev)
 	return 0;
 }
 
-void nebulae_sysfs_fini(struct nebulae_device *ndev)
+void nebulae_gpu_sysfs_fini(struct nebulae_device *ndev)
 {
 	if (!ndev->sysfs_registered)
 		return;

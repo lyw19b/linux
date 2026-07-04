@@ -8,7 +8,7 @@
 
 #include "nebulae_internal.h"
 
-irqreturn_t nebulae_irq(int irq, void *data)
+irqreturn_t nebulae_gpu_irq(int irq, void *data)
 {
 	struct nebulae_device *ndev = data;
 	u32 status;
