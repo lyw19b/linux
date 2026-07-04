@@ -41,6 +41,8 @@ static const struct drm_ioctl_desc nebulae_ioctls[] = {
 			  DRM_RENDER_ALLOW),
 	DRM_IOCTL_DEF_DRV(NEBULAE_BO_SET_DOMAIN, nebulae_ioctl_bo_set_domain,
 			  DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(NEBULAE_VM_BIND, nebulae_ioctl_vm_bind,
+			  DRM_RENDER_ALLOW),
 };
 
 DEFINE_DRM_GEM_FOPS(nebulae_fops);

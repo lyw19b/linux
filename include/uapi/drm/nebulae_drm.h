@@ -165,7 +165,8 @@ struct drm_nebulae_madvise {
 #define DRM_NEBULAE_SUBMIT_CMD_BO	0x07
 #define DRM_NEBULAE_BO_INFO		0x08
 #define DRM_NEBULAE_BO_SET_DOMAIN	0x09
-#define DRM_NEBULAE_NUM_IOCTLS		0x0a
+#define DRM_NEBULAE_VM_BIND		0x0a
+#define DRM_NEBULAE_NUM_IOCTLS		0x0b
 
 /* Query the BO metadata needed by user mode after import.  PRIME import gives
  * a per-file GEM handle; Mesa still needs the GPU VA, size, placement and
@@ -187,6 +188,18 @@ struct drm_nebulae_bo_set_domain {
 	__u32 read_domains;
 	__u32 write_domain;
 	__u32 pad;
+};
+
+#define DRM_NEBULAE_VM_BIND_OP_MAP	0
+#define DRM_NEBULAE_VM_BIND_OP_UNMAP	1
+
+/* Map (or unmap) a BO into the calling client's GPU address space at the BO's
+ * VA.  With sparse per-client page tables a client's own BOs are mapped on
+ * create, but a PRIME-imported BO has no owning file at import time; the
+ * importer must VM_BIND it before its waves can reach it. */
+struct drm_nebulae_vm_bind {
+	__u32 handle;
+	__u32 op;	/* DRM_NEBULAE_VM_BIND_OP_* */
 };
 
 #define DRM_IOCTL_NEBULAE_GET_PARAM \
@@ -219,6 +232,9 @@ struct drm_nebulae_bo_set_domain {
 #define DRM_IOCTL_NEBULAE_BO_SET_DOMAIN \
 	DRM_IOWR(DRM_COMMAND_BASE + DRM_NEBULAE_BO_SET_DOMAIN, \
 		 struct drm_nebulae_bo_set_domain)
+#define DRM_IOCTL_NEBULAE_VM_BIND \
+	DRM_IOWR(DRM_COMMAND_BASE + DRM_NEBULAE_VM_BIND, \
+		 struct drm_nebulae_vm_bind)
 
 #if defined(__cplusplus)
 }

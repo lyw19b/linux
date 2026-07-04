@@ -177,6 +177,8 @@ int nebulae_ioctl_bo_info(struct drm_device *drm, void *data,
 			  struct drm_file *file);
 int nebulae_ioctl_bo_set_domain(struct drm_device *drm, void *data,
 				struct drm_file *file);
+int nebulae_ioctl_vm_bind(struct drm_device *drm, void *data,
+			  struct drm_file *file);
 struct drm_gem_object *nebulae_gem_prime_import(struct drm_device *drm,
 						struct dma_buf *dma_buf);
 int nebulae_sync_all_bos_to_vram(struct nebulae_device *ndev);
@@ -194,6 +196,8 @@ int nebulae_mmu_ctx_alloc(struct nebulae_device *ndev,
 void nebulae_mmu_ctx_free(struct nebulae_device *ndev, u32 asid);
 int nebulae_mmu_map(struct nebulae_device *ndev, struct nebulae_file *nfile,
 		    u64 va, u64 size);
+void nebulae_mmu_unmap(struct nebulae_device *ndev, struct nebulae_file *nfile,
+		       u64 va, u64 size);
 int nebulae_alloc_bo_va(struct nebulae_device *ndev, struct nebulae_bo *bo,
 			u64 size);
 void nebulae_free_bo_va(struct nebulae_device *ndev, struct nebulae_bo *bo);

@@ -356,6 +356,37 @@ int nebulae_ioctl_bo_mmap(struct drm_device *drm, void *data,
 	return drm_gem_dumb_map_offset(file, drm, args->handle, &args->offset);
 }
 
+/* Map (or unmap) a BO into the calling client's address space.  Needed for
+ * PRIME-imported BOs, which have no owning file at import time and so are not
+ * mapped by the create path; the importer VM_BINDs them before use. */
+int nebulae_ioctl_vm_bind(struct drm_device *drm, void *data,
+			  struct drm_file *file)
+{
+	struct nebulae_device *ndev = to_nebulae(drm);
+	struct nebulae_file *nfile = file->driver_priv;
+	struct drm_nebulae_vm_bind *args = data;
+	struct drm_gem_object *obj;
+	struct nebulae_bo *bo;
+	int ret = 0;
+
+	obj = drm_gem_object_lookup(file, args->handle);
+	if (!obj)
+		return -ENOENT;
+	bo = to_nebulae_bo(obj);
+	if (!bo->va) {
+		drm_gem_object_put(obj);
+		return -EINVAL;
+	}
+
+	if (args->op == DRM_NEBULAE_VM_BIND_OP_UNMAP)
+		nebulae_mmu_unmap(ndev, nfile, bo->va, obj->size);
+	else
+		ret = nebulae_mmu_map(ndev, nfile, bo->va, obj->size);
+
+	drm_gem_object_put(obj);
+	return ret;
+}
+
 int nebulae_ioctl_bo_wait(struct drm_device *drm, void *data,
 			  struct drm_file *file)
 {

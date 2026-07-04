@@ -262,6 +262,35 @@ int nebulae_mmu_map(struct nebulae_device *ndev, struct nebulae_file *nfile,
 	return ret;
 }
 
+/* Clear leaf PTEs for a BO's VA range in this client's table (intermediate
+ * tables are left allocated in the slot). */
+void nebulae_mmu_unmap(struct nebulae_device *ndev, struct nebulae_file *nfile,
+		       u64 va, u64 size)
+{
+	u64 end = ALIGN(va + size, NEB_MMU_PAGE_SIZE);
+
+	if (!nfile->asid || !nfile->mmu_root)
+		return;
+	va = ALIGN_DOWN(va, NEB_MMU_PAGE_SIZE);
+
+	mutex_lock(&ndev->mmu_lock);
+	for (; va < end; va += NEB_MMU_PAGE_SIZE) {
+		u64 pte = neb_mmu_read_pte(ndev, nfile->mmu_root,
+					   neb_mmu_l2_index(va));
+		u64 l1, l0;
+
+		if (!(pte & NEB_MMU_PTE_VALID))
+			continue;
+		l1 = pte & NEB_MMU_PTE_ADDR_MASK;
+		pte = neb_mmu_read_pte(ndev, l1, neb_mmu_l1_index(va));
+		if (!(pte & NEB_MMU_PTE_VALID))
+			continue;
+		l0 = pte & NEB_MMU_PTE_ADDR_MASK;
+		neb_mmu_write_pte(ndev, l0, neb_mmu_l0_index(va), 0);
+	}
+	mutex_unlock(&ndev->mmu_lock);
+}
+
 void nebulae_mmu_ctx_free(struct nebulae_device *ndev, u32 asid)
 {
 	u32 slot;
