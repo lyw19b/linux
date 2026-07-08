@@ -30,14 +30,18 @@ irqreturn_t nebulae_gpu_irq(int irq, void *data)
 
 	if (status & NEB_IRQ_COMPLETE) {
 		atomic64_inc(&ndev->complete_irq_count);
-		atomic64_set(&ndev->completed_jobs,
-			     neb_readq(ndev, NEB_REG_COMPLETED_SEQ_LO));
 	}
 
 	if (status & NEB_IRQ_FAULT) {
 		atomic64_inc(&ndev->fault_irq_count);
 		WRITE_ONCE(ndev->last_error,
 			   readl(ndev->regs + NEB_REG_LAST_ERROR));
+	}
+
+	if (status & (NEB_IRQ_COMPLETE | NEB_IRQ_FAULT)) {
+		atomic64_set(&ndev->completed_jobs,
+			     neb_readq(ndev, NEB_REG_COMPLETED_SEQ_LO));
+		wake_up_all(&ndev->submit_wait);
 	}
 
 	if ((status & NEB_IRQ_DISPLAY) ||

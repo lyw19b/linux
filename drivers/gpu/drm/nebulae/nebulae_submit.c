@@ -125,6 +125,25 @@ static int nebulae_wait_fence(struct dma_fence *fence, u64 timeout_ns)
 	return 0;
 }
 
+static int nebulae_wait_hw_complete(struct nebulae_device *ndev, u64 seq)
+{
+	u64 completed;
+	int ret;
+
+	completed = neb_readq(ndev, NEB_REG_COMPLETED_SEQ_LO);
+	if (completed >= seq) {
+		atomic64_set(&ndev->completed_jobs, completed);
+		return 0;
+	}
+
+	ret = wait_event_interruptible(ndev->submit_wait,
+				       atomic64_read(&ndev->completed_jobs) >= seq);
+	if (ret)
+		return ret;
+
+	return 0;
+}
+
 static int nebulae_export_out_fence(struct drm_file *file,
 				    struct drm_nebulae_submit_cmd_bo *args,
 				    struct dma_fence *fence)
@@ -235,6 +254,7 @@ static int nebulae_hw_submit_cmd_bo(struct nebulae_device *ndev,
 	u64 ring_size;
 	u64 completed;
 	u32 cq_status = 0;
+	int ret;
 
 	if (!size || !cmd_count)
 		return -EINVAL;
@@ -288,15 +308,18 @@ static int nebulae_hw_submit_cmd_bo(struct nebulae_device *ndev,
 	writel(1, ndev->regs + NEB_REG_DOORBELL);
 
 	*seq = neb_readq(ndev, NEB_REG_JOB_SEQ_LO);
-	completed = neb_readq(ndev, NEB_REG_COMPLETED_SEQ_LO);
+	atomic64_set(&ndev->submitted_jobs, *seq);
+
+	ret = nebulae_wait_hw_complete(ndev, *seq);
+	completed = atomic64_read(&ndev->completed_jobs);
 	*hw_status = readl(ndev->regs + NEB_REG_LAST_ERROR);
 	WRITE_ONCE(ndev->last_error, *hw_status);
-	atomic64_set(&ndev->submitted_jobs, *seq);
-	atomic64_set(&ndev->completed_jobs, completed);
 	memcpy_fromio(cq, ndev->vram + NEB_INTERNAL_CQ_OFFSET, sizeof(cq));
 	mutex_unlock(&ndev->submit_lock);
 
-	if (completed != *seq)
+	if (ret)
+		return ret;
+	if (completed < *seq)
 		return -ETIMEDOUT;
 
 	if (neb_cmd_get_u32(cq, 0) == NEB_CQ_ENTRY_MAGIC &&
@@ -351,14 +374,12 @@ static int nebulae_submit_cmd_bo_direct(struct nebulae_device *ndev,
 	cookie = atomic64_inc_return(&nfile->submits);
 	nebulae_sched_record_submit(ndev);
 
-	ret = nebulae_sync_all_bos_to_vram(ndev);
+	ret = nebulae_bo_sync_to_vram(ndev, bo);
 	if (!ret)
 		ret = nebulae_hw_submit_cmd_bo(ndev, bo, args->offset,
 					       args->size, args->cmd_count,
 					       nfile->mmu_root, nfile->asid,
 					       cookie, &seq, &status);
-	if (!ret)
-		ret = nebulae_sync_all_bos_from_vram(ndev);
 
 	nebulae_sched_record_complete(ndev, ret);
 
@@ -379,7 +400,7 @@ static struct dma_fence *nebulae_job_run(struct drm_sched_job *sched_job)
 	if (unlikely(job->base.s_fence->finished.error))
 		return NULL;
 
-	ret = nebulae_sync_all_bos_to_vram(ndev);
+	ret = nebulae_bo_sync_to_vram(ndev, job->cmd_bo);
 	if (!ret)
 		ret = nebulae_hw_submit_cmd_bo(ndev, job->cmd_bo, job->offset,
 					       job->size, job->cmd_count,
@@ -387,8 +408,6 @@ static struct dma_fence *nebulae_job_run(struct drm_sched_job *sched_job)
 					       job->cookie,
 					       &job->hw_seq,
 					       &job->hw_status);
-	if (!ret)
-		ret = nebulae_sync_all_bos_from_vram(ndev);
 
 	job->result = ret;
 

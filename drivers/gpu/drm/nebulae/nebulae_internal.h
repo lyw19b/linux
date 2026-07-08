@@ -12,6 +12,7 @@
 #include <linux/platform_device.h>
 #include <linux/sizes.h>
 #include <linux/spinlock.h>
+#include <linux/wait.h>
 
 #include <drm/drm_connector.h>
 #include <drm/drm_device.h>
@@ -69,6 +70,7 @@ struct nebulae_device {
 	int irq;
 	struct mutex bo_lock;
 	struct mutex submit_lock;
+	wait_queue_head_t submit_wait;
 	spinlock_t fence_lock;
 	struct drm_gpu_scheduler scheduler;
 	struct list_head bo_list;
@@ -183,6 +185,8 @@ struct drm_gem_object *nebulae_gem_prime_import(struct drm_device *drm,
 						struct dma_buf *dma_buf);
 int nebulae_sync_all_bos_to_vram(struct nebulae_device *ndev);
 int nebulae_sync_all_bos_from_vram(struct nebulae_device *ndev);
+int nebulae_bo_sync_to_vram(struct nebulae_device *ndev,
+			    struct nebulae_bo *bo);
 int nebulae_bo_sync_from_vram(struct nebulae_device *ndev,
 			      struct nebulae_bo *bo);
 

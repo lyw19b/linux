@@ -197,6 +197,7 @@ int nebulae_device_probe(struct platform_device *pdev)
 
 	mutex_init(&ndev->bo_lock);
 	mutex_init(&ndev->submit_lock);
+	init_waitqueue_head(&ndev->submit_wait);
 	INIT_LIST_HEAD(&ndev->bo_list);
 	ret = nebulae_vm_init(ndev);
 	if (ret)
