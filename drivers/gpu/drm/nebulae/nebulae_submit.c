@@ -7,6 +7,7 @@
 #include <linux/errno.h>
 #include <linux/file.h>
 #include <linux/io.h>
+#include <linux/jiffies.h>
 #include <linux/sync_file.h>
 
 #include <asm/unaligned.h>
@@ -53,6 +54,9 @@
 #define NEB_CQ_COOKIE			8
 #define NEB_CQ_HW_SEQ			16
 #define NEB_CQ_COMPLETED_SEQ		24
+
+#define NEB_HW_WAIT_RECHECK_MS		100
+#define NEB_HW_WAIT_TIMEOUT_MS		30000
 
 struct nebulae_fence {
 	struct dma_fence base;
@@ -125,23 +129,48 @@ static int nebulae_wait_fence(struct dma_fence *fence, u64 timeout_ns)
 	return 0;
 }
 
-static int nebulae_wait_hw_complete(struct nebulae_device *ndev, u64 seq)
+static bool nebulae_hw_complete_seen(struct nebulae_device *ndev, u64 seq)
 {
 	u64 completed;
-	int ret;
 
 	completed = neb_readq(ndev, NEB_REG_COMPLETED_SEQ_LO);
 	if (completed >= seq) {
 		atomic64_set(&ndev->completed_jobs, completed);
-		return 0;
+		return true;
 	}
 
-	ret = wait_event_interruptible(ndev->submit_wait,
-				       atomic64_read(&ndev->completed_jobs) >= seq);
-	if (ret)
-		return ret;
+	return atomic64_read(&ndev->completed_jobs) >= seq;
+}
 
-	return 0;
+static int nebulae_wait_hw_complete(struct nebulae_device *ndev, u64 seq)
+{
+	unsigned long deadline;
+	unsigned long recheck;
+	signed long ret;
+
+	deadline = jiffies + msecs_to_jiffies(NEB_HW_WAIT_TIMEOUT_MS);
+
+	for (;;) {
+		if (nebulae_hw_complete_seen(ndev, seq))
+			return 0;
+
+		if (time_after_eq(jiffies, deadline))
+			return -ETIMEDOUT;
+
+		recheck = min_t(unsigned long,
+				msecs_to_jiffies(NEB_HW_WAIT_RECHECK_MS),
+				deadline - jiffies);
+		if (!recheck)
+			recheck = 1;
+
+		ret = wait_event_interruptible_timeout(
+			ndev->submit_wait,
+			nebulae_hw_complete_seen(ndev, seq),
+			recheck);
+		if (ret < 0)
+			return ret;
+	}
+
 }
 
 static int nebulae_export_out_fence(struct drm_file *file,

@@ -8,7 +8,7 @@
 
 #include "nebulae_internal.h"
 
-#define NEBULAE_JOB_TIMEOUT_MS	5000
+#define NEBULAE_JOB_TIMEOUT_MS	60000
 
 int nebulae_sched_init(struct nebulae_device *ndev)
 {
