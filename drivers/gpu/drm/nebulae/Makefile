@@ -12,6 +12,8 @@ nebulae-y := \
 	nebulae_sched.o \
 	nebulae_submit.o \
 	nebulae_irq.o \
+	nebulae_recovery.o \
+	nebulae_trace.o \
 	nebulae_debugfs.o \
 	nebulae_sysfs.o \
 	nebulae_kms.o \

@@ -10,6 +10,7 @@
 #include <linux/io.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/pm_runtime.h>
 #include <linux/string.h>
 
 #include <drm/drm_atomic_helper.h>
@@ -29,28 +30,120 @@
 				 NEB_FEATURE_COMPUTE | NEB_FEATURE_MEMORY | \
 				 NEB_FEATURE_TEXTURE | NEB_FEATURE_MMU)
 
+int nebulae_device_enter(struct nebulae_device *ndev, int *idx)
+{
+	int ret;
+
+	ret = pm_runtime_resume_and_get(ndev->drm.dev);
+	if (ret < 0)
+		return ret;
+	if (!drm_dev_enter(&ndev->drm, idx)) {
+		ret = -ENODEV;
+		goto err_pm;
+	}
+	mutex_lock(&ndev->reset_lock);
+	if (ndev->resetting) {
+		ret = -EAGAIN;
+		goto err_unlock;
+	}
+	if (ndev->suspended || ndev->wedged || ndev->unplugged) {
+		ret = -ENODEV;
+		goto err_unlock;
+	}
+	atomic_inc(&ndev->active_ops);
+	mutex_unlock(&ndev->reset_lock);
+	return 0;
+
+err_unlock:
+	mutex_unlock(&ndev->reset_lock);
+	drm_dev_exit(*idx);
+err_pm:
+	pm_runtime_mark_last_busy(ndev->drm.dev);
+	pm_runtime_put_autosuspend(ndev->drm.dev);
+	return ret;
+}
+
+void nebulae_device_exit(struct nebulae_device *ndev, int idx)
+{
+	if (atomic_dec_and_test(&ndev->active_ops))
+		wake_up_all(&ndev->active_op_wait);
+	drm_dev_exit(idx);
+	pm_runtime_mark_last_busy(ndev->drm.dev);
+	pm_runtime_put_autosuspend(ndev->drm.dev);
+}
+
+struct nebulae_hw_profile {
+	u32 version;
+	u32 required_caps;
+	struct drm_nebulae_device_info info;
+};
+
+/* NEB_REG_VERSION is the v1 simulator's read-only discovery key.  Resource
+ * limits are deliberately limited to what the in-kernel v5.7 validator
+ * understands, rather than copying larger aspirational schema maxima. */
+static const struct nebulae_hw_profile nebulae_hw_profiles[] = {
+	{
+		.version = 0x00010000,
+		.required_caps = NEB_CAP_IRQ | NEB_CAP_CP_QUEUE |
+				 NEB_CAP_TLB_INVALIDATE | NEB_CAP_FULL_GPUVM |
+				 NEB_CAP_ICACHE_INVALIDATE,
+		.info = {
+			.isa_major = 5,
+			.isa_minor = 7,
+			.wave_size = 32,
+			.num_compute_units = 1,
+			.max_sr_count = 100,
+			.max_user_sr_count = 80,
+			.max_vr_count = 128,
+			.max_scratch_bytes_per_wave = 512,
+			.max_wgm_bytes_per_workgroup = 32 * 1024,
+			.max_waves_per_cu = 16,
+			.max_workgroup_invocations = 1024,
+			.max_textures = 256,
+			.max_samplers = 256,
+			.max_images = 8,
+			.max_ubos = 256,
+			.max_ssbos = 256,
+		},
+	},
+};
+
+static int nebulae_discover_device(struct nebulae_device *ndev)
+{
+	const struct nebulae_hw_profile *profile = NULL;
+	u64 features = NEB_FEATURE_CORE | NEB_FEATURE_MEMORY | NEB_FEATURE_MMU;
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(nebulae_hw_profiles); i++) {
+		if (nebulae_hw_profiles[i].version == ndev->version) {
+			profile = &nebulae_hw_profiles[i];
+			break;
+		}
+	}
+	if (!profile)
+		return dev_err_probe(ndev->drm.dev, -ENODEV,
+				     "unknown discovery version 0x%08x\n",
+				     ndev->version);
+	if ((ndev->hw_caps & profile->required_caps) != profile->required_caps)
+		return dev_err_probe(ndev->drm.dev, -ENODEV,
+				     "version 0x%08x missing required caps 0x%08x (got 0x%08x)\n",
+				     ndev->version, profile->required_caps,
+				     ndev->hw_caps);
+
+	ndev->device_info = profile->info;
+	ndev->device_info.vram_size = ndev->vram_size;
+	if (ndev->hw_caps & NEB_CAP_CP_QUEUE)
+		features |= NEB_FEATURE_GRAPHICS | NEB_FEATURE_TEXTURE;
+	if (ndev->hw_caps & NEB_CAP_NDRANGE)
+		features |= NEB_FEATURE_COMPUTE;
+	ndev->device_info.supported_features = features & NEB_SUPPORTED_FEATURES;
+	return 0;
+}
+
 void nebulae_fill_device_info(struct nebulae_device *ndev,
 			      struct drm_nebulae_device_info *info)
 {
-	memset(info, 0, sizeof(*info));
-	info->isa_major = 4;
-	info->isa_minor = 4;
-	info->wave_size = 32;
-	info->num_compute_units = 1;
-	info->vram_size = ndev->vram_size;
-	info->max_sr_count = 100;
-	info->max_user_sr_count = 96;
-	info->max_vr_count = 128;
-	info->max_scratch_bytes_per_wave = 512;
-	info->max_wgm_bytes_per_workgroup = 32 * 1024;
-	info->max_waves_per_cu = 16;
-	info->max_workgroup_invocations = 1024;
-	info->max_textures = 16;
-	info->max_samplers = 16;
-	info->max_images = 8;
-	info->max_ubos = 16;
-	info->max_ssbos = 16;
-	info->supported_features = NEB_SUPPORTED_FEATURES;
+	*info = ndev->device_info;
 }
 
 int nebulae_get_param_value(struct nebulae_device *ndev, u32 param,
@@ -122,7 +215,10 @@ int nebulae_get_param_value(struct nebulae_device *ndev, u32 param,
 		*value = DRM_NEBULAE_SUBMIT_CAP_ASYNC |
 			 DRM_NEBULAE_SUBMIT_CAP_CMD_BO |
 			 DRM_NEBULAE_SUBMIT_CAP_SYNCOBJ |
-			 DRM_NEBULAE_SUBMIT_CAP_FENCE_FD;
+			 DRM_NEBULAE_SUBMIT_CAP_FENCE_FD |
+			 DRM_NEBULAE_SUBMIT_CAP_BO_LIST;
+		if (ndev->hw_caps & NEB_CAP_JOB_CONTROL)
+			*value |= DRM_NEBULAE_SUBMIT_CAP_JOB_CONTROL;
 		break;
 	default:
 		return -EINVAL;
@@ -194,10 +290,17 @@ int nebulae_device_probe(struct platform_device *pdev)
 	ndev->vram_size = resource_size(vram_res);
 	if (reported_vram && reported_vram < ndev->vram_size)
 		ndev->vram_size = reported_vram;
+	ret = nebulae_discover_device(ndev);
+	if (ret)
+		return ret;
 
 	mutex_init(&ndev->bo_lock);
 	mutex_init(&ndev->submit_lock);
+	mutex_init(&ndev->files_lock);
+	spin_lock_init(&ndev->scanout_lock);
 	init_waitqueue_head(&ndev->submit_wait);
+	init_waitqueue_head(&ndev->active_op_wait);
+	atomic_set(&ndev->active_ops, 0);
 	INIT_LIST_HEAD(&ndev->bo_list);
 	ret = nebulae_vm_init(ndev);
 	if (ret)
@@ -227,20 +330,28 @@ int nebulae_device_probe(struct platform_device *pdev)
 	ret = nebulae_sched_init(ndev);
 	if (ret)
 		goto err_ctx;
+	spin_lock_init(&ndev->hw_lock);
+	nebulae_irq_init(ndev);
+	nebulae_recovery_init(ndev);
+	ndev->irq = -1;
 
-	ndev->irq = platform_get_irq_optional(pdev, 0);
-	if (ndev->irq > 0) {
-		writel(NEB_IRQ_ALL, ndev->regs + NEB_REG_IRQ_STATUS);
-		writel(NEB_DISPLAY_IRQ_FLIP_DONE,
-		       ndev->regs + NEB_REG_DISPLAY_IRQ_STATUS);
-		writel(NEB_IRQ_ALL, ndev->regs + NEB_REG_IRQ_MASK);
-		writel(NEB_DISPLAY_IRQ_FLIP_DONE,
-		       ndev->regs + NEB_REG_DISPLAY_IRQ_MASK);
-		ret = devm_request_irq(dev, ndev->irq, nebulae_gpu_irq, 0,
-				       dev_name(dev), ndev);
-		if (ret)
-			goto err_sched;
+	/* Render completion is a real IRQ fence.  Do not expose a pseudo-async
+	 * driver on platforms that omitted the completion interrupt. */
+	ndev->irq = platform_get_irq(pdev, 0);
+	if (ndev->irq < 0) {
+		ret = ndev->irq;
+		goto err_irq;
 	}
+	writel(NEB_IRQ_ALL, ndev->regs + NEB_REG_IRQ_STATUS);
+	writel(NEB_DISPLAY_IRQ_FLIP_DONE,
+	       ndev->regs + NEB_REG_DISPLAY_IRQ_STATUS);
+	ret = devm_request_irq(dev, ndev->irq, nebulae_gpu_irq, 0,
+			       dev_name(dev), ndev);
+	if (ret)
+		goto err_irq;
+	writel(NEB_IRQ_ALL, ndev->regs + NEB_REG_IRQ_MASK);
+	writel(NEB_DISPLAY_IRQ_FLIP_DONE,
+	       ndev->regs + NEB_REG_DISPLAY_IRQ_MASK);
 
 	ret = nebulae_kms_init(ndev);
 	if (ret)
@@ -255,6 +366,12 @@ int nebulae_device_probe(struct platform_device *pdev)
 		goto err_unregister;
 
 	drm_fbdev_shmem_setup(drm, 32);
+	pm_runtime_set_autosuspend_delay(dev, 1000);
+	pm_runtime_use_autosuspend(dev);
+	pm_runtime_set_active(dev);
+	pm_runtime_enable(dev);
+	pm_runtime_mark_last_busy(dev);
+	pm_runtime_idle(dev);
 
 	drm_info(drm,
 		 "Nebulae DRM graphics v%08x caps 0x%08x vram %llu bytes vm [0x%llx-0x%llx) irq %d\n",
@@ -264,7 +381,15 @@ int nebulae_device_probe(struct platform_device *pdev)
 
 err_unregister:
 	drm_dev_unregister(drm);
+	nebulae_vblank_fini(ndev);
 err_sched:
+	if (ndev->irq >= 0) {
+		writel(0, ndev->regs + NEB_REG_IRQ_MASK);
+		synchronize_irq(ndev->irq);
+	}
+err_irq:
+	nebulae_recovery_fini(ndev);
+	nebulae_irq_fini(ndev);
 	nebulae_gpu_sched_fini(ndev);
 err_ctx:
 	nebulae_ctx_fini(ndev);
@@ -278,14 +403,32 @@ void nebulae_device_remove(struct platform_device *pdev)
 {
 	struct drm_device *drm = platform_get_drvdata(pdev);
 	struct nebulae_device *ndev = to_nebulae(drm);
+	struct device *dev = &pdev->dev;
 
 	nebulae_gpu_sysfs_fini(ndev);
-	drm_dev_unregister(drm);
 	drm_atomic_helper_shutdown(drm);
+	nebulae_vblank_fini(ndev);
+	pm_runtime_get_sync(dev);
+	pm_runtime_disable(dev);
+	pm_runtime_put_noidle(dev);
+	/* Block all new drm_dev_enter() users before platform resources can be
+	 * released, then drain recovery/IRQ completion and active DMA state. */
+	mutex_lock(&ndev->reset_lock);
+	WRITE_ONCE(ndev->unplugged, true);
+	WRITE_ONCE(ndev->suspended, true);
+	WRITE_ONCE(ndev->wedged, true);
+	mutex_unlock(&ndev->reset_lock);
+	drm_dev_unplug(drm);
 	if (ndev->regs) {
 		writel(0, ndev->regs + NEB_REG_IRQ_MASK);
 		writel(0, ndev->regs + NEB_REG_DISPLAY_IRQ_MASK);
 	}
+	if (ndev->irq >= 0)
+		synchronize_irq(ndev->irq);
+	nebulae_irq_fini(ndev);
+	nebulae_recovery_fini(ndev);
+	nebulae_submit_abort_active(ndev, -ENODEV, DRM_NEBULAE_FAULT_RESET);
+	wait_event(ndev->active_op_wait, !atomic_read(&ndev->active_ops));
 	nebulae_gpu_sched_fini(ndev);
 	nebulae_ctx_fini(ndev);
 	nebulae_mmu_fini(ndev);
@@ -296,6 +439,10 @@ void nebulae_device_shutdown(struct platform_device *pdev)
 {
 	struct drm_device *drm = platform_get_drvdata(pdev);
 
-	if (drm)
+	if (drm) {
+		struct nebulae_device *ndev = to_nebulae(drm);
+
 		drm_atomic_helper_shutdown(drm);
+		nebulae_vblank_fini(ndev);
+	}
 }

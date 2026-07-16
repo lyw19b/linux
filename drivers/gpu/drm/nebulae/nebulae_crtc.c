@@ -36,6 +36,8 @@ static const struct drm_simple_display_pipe_funcs nebulae_pipe_funcs = {
 	.disable = nebulae_plane_disable,
 	.check = nebulae_plane_check,
 	.update = nebulae_plane_update,
+	.enable_vblank = nebulae_vblank_enable,
+	.disable_vblank = nebulae_vblank_disable,
 };
 
 static const u32 nebulae_pipe_formats[] = {

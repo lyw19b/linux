@@ -16,7 +16,7 @@ extern "C" {
 #endif
 
 #define DRM_NEBULAE_DRIVER_MAJOR	1
-#define DRM_NEBULAE_DRIVER_MINOR	0
+#define DRM_NEBULAE_DRIVER_MINOR	1
 
 enum drm_nebulae_param {
 	DRM_NEBULAE_PARAM_ISA_MAJOR = 0,
@@ -41,13 +41,15 @@ enum drm_nebulae_param {
 	DRM_NEBULAE_PARAM_SUBMIT_CAPS,
 };
 
-#define DRM_NEBULAE_UAPI_VERSION			2
+#define DRM_NEBULAE_UAPI_VERSION			5
 
 #define DRM_NEBULAE_SUBMIT_CAP_USERPTR_CMD_STREAM	(1ULL << 0)
 #define DRM_NEBULAE_SUBMIT_CAP_CMD_BO			(1ULL << 1)
 #define DRM_NEBULAE_SUBMIT_CAP_SYNCOBJ			(1ULL << 2)
 #define DRM_NEBULAE_SUBMIT_CAP_FENCE_FD			(1ULL << 3)
 #define DRM_NEBULAE_SUBMIT_CAP_ASYNC			(1ULL << 4)
+#define DRM_NEBULAE_SUBMIT_CAP_JOB_CONTROL		(1ULL << 5)
+#define DRM_NEBULAE_SUBMIT_CAP_BO_LIST			(1ULL << 6)
 
 #define DRM_NEBULAE_BO_WC				(1U << 0)
 #define DRM_NEBULAE_BO_PLACEMENT_SHIFT			16
@@ -120,6 +122,7 @@ struct drm_nebulae_bo_mmap_offset {
 struct drm_nebulae_bo_wait {
 	__u32 handle;
 	__u32 pad;
+	/* Relative timeout.  Zero waits indefinitely. */
 	__u64 timeout_ns;
 };
 
@@ -146,6 +149,9 @@ struct drm_nebulae_submit_cmd_bo {
 	__u64 timeout_ns;
 	__u32 status;
 	__s32 driver_error;
+	__u64 bo_handles;
+	__u32 bo_handle_count;
+	__u32 pad;
 };
 
 struct drm_nebulae_madvise {
@@ -154,6 +160,9 @@ struct drm_nebulae_madvise {
 	__u32 retained;
 	__u32 pad;
 };
+
+#define DRM_NEBULAE_MADV_WILLNEED	0
+#define DRM_NEBULAE_MADV_DONTNEED	1
 
 #define DRM_NEBULAE_GET_PARAM		0x00
 #define DRM_NEBULAE_GET_INFO		0x01
@@ -166,7 +175,9 @@ struct drm_nebulae_madvise {
 #define DRM_NEBULAE_BO_INFO		0x08
 #define DRM_NEBULAE_BO_SET_DOMAIN	0x09
 #define DRM_NEBULAE_VM_BIND		0x0a
-#define DRM_NEBULAE_NUM_IOCTLS		0x0b
+#define DRM_NEBULAE_JOB_CONTROL		0x0b
+#define DRM_NEBULAE_GET_FAULT		0x0c
+#define DRM_NEBULAE_NUM_IOCTLS		0x0d
 
 /* Query the BO metadata needed by user mode after import.  PRIME import gives
  * a per-file GEM handle; Mesa still needs the GPU VA, size, placement and
@@ -200,6 +211,63 @@ struct drm_nebulae_bo_set_domain {
 struct drm_nebulae_vm_bind {
 	__u32 handle;
 	__u32 op;	/* DRM_NEBULAE_VM_BIND_OP_* */
+	/* MAP: returned per-file GPU VA. UNMAP: VA that was removed. */
+	__u64 va;
+	__u64 reserved[2];
+};
+
+#define DRM_NEBULAE_JOB_CONTROL_CANCEL	0
+#define DRM_NEBULAE_JOB_CONTROL_KILL	1
+
+struct drm_nebulae_job_control {
+	__u64 seq;
+	__u32 op;	/* DRM_NEBULAE_JOB_CONTROL_* */
+	__u32 flags;
+	__u32 status;
+	__s32 driver_error;
+};
+
+/* Fault records are scoped to the DRM file/context that submitted the job.
+ * Flags explicitly state which optional hardware evidence is valid; the v1
+ * simulator has no fault-address/token CSR and therefore never sets VALID_VA
+ * or REPLAYABLE. */
+#define DRM_NEBULAE_FAULT_NOT_PRESENT	1
+#define DRM_NEBULAE_FAULT_PERMISSION	2
+#define DRM_NEBULAE_FAULT_BUS		3
+#define DRM_NEBULAE_FAULT_ILLEGAL_PACKET	4
+#define DRM_NEBULAE_FAULT_TIMEOUT	5
+#define DRM_NEBULAE_FAULT_RESET		6
+#define DRM_NEBULAE_FAULT_UNKNOWN	0xff
+
+#define DRM_NEBULAE_FAULT_ACCESS_READ	(1U << 0)
+#define DRM_NEBULAE_FAULT_ACCESS_WRITE	(1U << 1)
+#define DRM_NEBULAE_FAULT_ACCESS_EXEC	(1U << 2)
+
+#define DRM_NEBULAE_FAULT_FLAG_VALID_VA		(1U << 0)
+#define DRM_NEBULAE_FAULT_FLAG_REPLAYABLE	(1U << 1)
+#define DRM_NEBULAE_FAULT_FLAG_RESET_REQUIRED	(1U << 2)
+
+struct drm_nebulae_fault {
+	__u64 sequence;
+	__u64 timestamp_ns;
+	__u64 ctx_id;
+	__u64 job_seq;
+	__u64 va;
+	__u64 replay_token;
+	__u32 asid;
+	__u32 reason;
+	__u32 access;
+	__u32 flags;
+	__u32 hw_status;
+	__s32 driver_error;
+};
+
+#define DRM_NEBULAE_GET_FAULT_PEEK	(1U << 0)
+
+struct drm_nebulae_get_fault {
+	__u32 flags;
+	__u32 pad;
+	struct drm_nebulae_fault fault;
 };
 
 #define DRM_IOCTL_NEBULAE_GET_PARAM \
@@ -235,6 +303,12 @@ struct drm_nebulae_vm_bind {
 #define DRM_IOCTL_NEBULAE_VM_BIND \
 	DRM_IOWR(DRM_COMMAND_BASE + DRM_NEBULAE_VM_BIND, \
 		 struct drm_nebulae_vm_bind)
+#define DRM_IOCTL_NEBULAE_JOB_CONTROL \
+	DRM_IOWR(DRM_COMMAND_BASE + DRM_NEBULAE_JOB_CONTROL, \
+		 struct drm_nebulae_job_control)
+#define DRM_IOCTL_NEBULAE_GET_FAULT \
+	DRM_IOWR(DRM_COMMAND_BASE + DRM_NEBULAE_GET_FAULT, \
+		 struct drm_nebulae_get_fault)
 
 #if defined(__cplusplus)
 }

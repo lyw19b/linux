@@ -6,6 +6,7 @@
 #include <linux/dma-direction.h>
 #include <linux/errno.h>
 #include <linux/io.h>
+#include <linux/pm_runtime.h>
 
 #include <drm/drm_drv.h>
 #include <drm/drm_fourcc.h>
@@ -14,6 +15,7 @@
 #include <drm/drm_gem_atomic_helper.h>
 #include <drm/drm_gem_framebuffer_helper.h>
 #include <drm/drm_rect.h>
+#include <drm/drm_vblank.h>
 
 #include "nebulae_internal.h"
 
@@ -33,6 +35,21 @@ static void nebulae_program_display(struct nebulae_device *ndev,
 				    u32 plane_format, u32 plane_flags,
 				    u64 plane_size)
 {
+	unsigned long flags;
+	u64 active_base = plane_flags & NEB_DISPLAY_PLANE_VALID ?
+			  plane_base : 0;
+
+	/* Publish ownership before the MMIO tuple.  A concurrent submit may be
+	 * classified conservatively against the new plane, while atomic FB
+	 * reservation fences prevent that plane becoming active ahead of a writer
+	 * which already references it. */
+	spin_lock_irqsave(&ndev->scanout_lock, flags);
+	ndev->scanout_base = active_base;
+	ndev->scanout_size = scanout_size;
+	ndev->scanout_direct =
+		(plane_flags & NEB_DISPLAY_PLANE_VALID) != 0;
+	ndev->scanout_generation++;
+
 	writel(0, ndev->regs + NEB_REG_DISPLAY_ENABLE);
 	writel(width, ndev->regs + NEB_REG_DISPLAY_WIDTH);
 	writel(height, ndev->regs + NEB_REG_DISPLAY_HEIGHT);
@@ -48,6 +65,7 @@ static void nebulae_program_display(struct nebulae_device *ndev,
 	writel((u32)plane_size, ndev->regs + NEB_REG_DISPLAY_PLANE_SIZE);
 	writel(1, ndev->regs + NEB_REG_DISPLAY_ENABLE);
 	writel(1, ndev->regs + NEB_REG_DISPLAY_FLIP);
+	spin_unlock_irqrestore(&ndev->scanout_lock, flags);
 	nebulae_vblank_record_flip(ndev);
 }
 
@@ -56,7 +74,8 @@ static bool nebulae_fb_has_gpu_plane(struct nebulae_bo *bo, u64 offset,
 {
 	struct drm_gem_object *obj = &bo->base.base;
 
-	return bo->va && offset <= obj->size && scanout_size <= obj->size - offset;
+	return bo->vram_offset && offset <= obj->size &&
+	       scanout_size <= obj->size - offset;
 }
 
 static u32 nebulae_fb_plane_format(const struct drm_framebuffer *fb)
@@ -82,7 +101,7 @@ static void nebulae_program_gpu_plane(struct nebulae_device *ndev,
 	mutex_unlock(&ndev->bo_lock);
 
 	nebulae_program_display(ndev, width, height, fb->pitches[0],
-				 scanout_size, bo->va + offset, fb->pitches[0],
+				 scanout_size, bo->vram_offset + offset, fb->pitches[0],
 				 nebulae_fb_plane_format(fb),
 				 NEB_DISPLAY_PLANE_VALID, scanout_size);
 }
@@ -119,26 +138,33 @@ static void nebulae_kms_update_scanout(struct nebulae_device *ndev,
 		return;
 
 	if (nebulae_fb_has_gpu_plane(bo, fb->offsets[0], scanout_size)) {
-		if (!drm_dev_enter(&ndev->drm, &idx))
+		ret = nebulae_device_enter(ndev, &idx);
+		if (ret)
 			return;
+		if (bo->domain & DRM_NEBULAE_BO_DOMAIN_CPU) {
+			ret = nebulae_bo_sync_to_vram(ndev, bo);
+			if (ret) {
+				nebulae_device_exit(ndev, idx);
+				return;
+			}
+		}
 		nebulae_program_gpu_plane(ndev, fb, bo, width, height,
 					   scanout_size);
-		drm_dev_exit(idx);
+		nebulae_device_exit(ndev, idx);
 		return;
 	}
 
-	/* The simulated render path completes submissions synchronously.  Waiting
-	 * for implicit framebuffer fences here can deadlock the Xorg dirty path:
-	 * Present waits for DirtyFB to finish, while DirtyFB waits for a dma-buf
-	 * fence that is only retired by the same single-threaded display flow.
-	 * Mapping directly is sufficient for this shadow-blit model. */
+	/* Atomic GEM helpers resolve framebuffer dependencies before this update.
+	 * Do not introduce a second reservation wait while mapping the fallback
+	 * shadow-blit source. */
 	ret = drm_gem_fb_vmap(fb, map, data);
 	if (ret)
 		return;
 	if (data[0].is_iomem)
 		goto out_vunmap;
 
-	if (!drm_dev_enter(&ndev->drm, &idx))
+	ret = nebulae_device_enter(ndev, &idx);
+	if (ret)
 		goto out_vunmap;
 
 	dst_pitch[0] = fb->pitches[0];
@@ -148,10 +174,28 @@ static void nebulae_kms_update_scanout(struct nebulae_device *ndev,
 				 scanout_size, 0, 0,
 				 NEB_DISPLAY_FORMAT_XRGB8888, 0, 0);
 
-	drm_dev_exit(idx);
+	nebulae_device_exit(ndev, idx);
 
 out_vunmap:
 	drm_gem_fb_vunmap(fb, map);
+}
+
+static void nebulae_pipe_send_event(struct drm_simple_display_pipe *pipe)
+{
+	struct drm_crtc *crtc = &pipe->crtc;
+	struct drm_pending_vblank_event *event = crtc->state->event;
+
+	if (!event)
+		return;
+
+	crtc->state->event = NULL;
+
+	spin_lock_irq(&crtc->dev->event_lock);
+	if (crtc->state->active && drm_crtc_vblank_get(crtc) == 0)
+		drm_crtc_arm_vblank_event(crtc, event);
+	else
+		drm_crtc_send_vblank_event(crtc, event);
+	spin_unlock_irq(&crtc->dev->event_lock);
 }
 
 int nebulae_plane_check(struct drm_simple_display_pipe *pipe,
@@ -165,7 +209,7 @@ int nebulae_plane_check(struct drm_simple_display_pipe *pipe,
 	unsigned int height;
 	u64 scanout_size;
 
-	crtc_state->no_vblank = true;
+	crtc_state->no_vblank = false;
 
 	if (!fb || !plane_state->visible)
 		return 0;
@@ -197,20 +241,44 @@ void nebulae_plane_enable(struct drm_simple_display_pipe *pipe,
 			  struct drm_plane_state *plane_state)
 {
 	struct nebulae_device *ndev = to_nebulae(pipe->crtc.dev);
+	int ret;
+
+	if (!ndev->display_pm_ref) {
+		ret = pm_runtime_resume_and_get(ndev->drm.dev);
+		if (ret < 0)
+			return;
+		ndev->display_pm_ref = true;
+	}
 
 	nebulae_kms_update_scanout(ndev, plane_state);
+	drm_crtc_vblank_on(&pipe->crtc);
+	nebulae_pipe_send_event(pipe);
 }
 
 void nebulae_plane_disable(struct drm_simple_display_pipe *pipe)
 {
 	struct nebulae_device *ndev = to_nebulae(pipe->crtc.dev);
+	unsigned long flags;
 	int idx;
+	int ret;
 
-	if (!drm_dev_enter(&ndev->drm, &idx))
-		return;
-
-	writel(0, ndev->regs + NEB_REG_DISPLAY_ENABLE);
-	drm_dev_exit(idx);
+	drm_crtc_vblank_off(&pipe->crtc);
+	ret = nebulae_device_enter(ndev, &idx);
+	if (!ret) {
+		spin_lock_irqsave(&ndev->scanout_lock, flags);
+		writel(0, ndev->regs + NEB_REG_DISPLAY_ENABLE);
+		ndev->scanout_base = 0;
+		ndev->scanout_size = 0;
+		ndev->scanout_direct = false;
+		ndev->scanout_generation++;
+		spin_unlock_irqrestore(&ndev->scanout_lock, flags);
+		nebulae_device_exit(ndev, idx);
+	}
+	if (ndev->display_pm_ref) {
+		ndev->display_pm_ref = false;
+		pm_runtime_mark_last_busy(ndev->drm.dev);
+		pm_runtime_put_autosuspend(ndev->drm.dev);
+	}
 }
 
 void nebulae_plane_update(struct drm_simple_display_pipe *pipe,
@@ -219,4 +287,5 @@ void nebulae_plane_update(struct drm_simple_display_pipe *pipe,
 	struct nebulae_device *ndev = to_nebulae(pipe->crtc.dev);
 
 	nebulae_kms_update_scanout(ndev, pipe->plane.state);
+	nebulae_pipe_send_event(pipe);
 }

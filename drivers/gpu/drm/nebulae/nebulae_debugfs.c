@@ -75,21 +75,66 @@ static int nebulae_debugfs_info(struct seq_file *m, void *data)
 	seq_printf(m, "open_contexts: %lld\n",
 		   atomic64_read(&ndev->open_contexts));
 	seq_printf(m, "last_error: 0x%08x\n", READ_ONCE(ndev->last_error));
+	seq_printf(m, "reset_count: %lld\n",
+		   atomic64_read(&ndev->reset_count));
+	seq_printf(m, "last_reset_reason: %u\n", ndev->last_reset_reason);
+	seq_printf(m, "last_reset_timestamp_ns: %llu\n",
+		   ndev->last_reset_timestamp_ns);
+	seq_printf(m, "resetting: %u\n", READ_ONCE(ndev->resetting));
+	seq_printf(m, "suspended: %u\n", READ_ONCE(ndev->suspended));
+	seq_printf(m, "wedged: %u\n", READ_ONCE(ndev->wedged));
 
+	return 0;
+}
+
+static int nebulae_debugfs_faults(struct seq_file *m, void *data)
+{
+	struct nebulae_device *ndev = nebulae_debugfs_device(m);
+	struct drm_nebulae_fault fault;
+	struct nebulae_file *nfile;
+	unsigned long flags;
+
+	spin_lock_irqsave(&ndev->fault_lock, flags);
+	fault = ndev->last_fault;
+	spin_unlock_irqrestore(&ndev->fault_lock, flags);
+	seq_printf(m,
+		   "last sequence=%llu time_ns=%llu ctx=%llu job=%llu asid=%u reason=%u access=0x%x flags=0x%x va=0x%llx token=0x%llx hw_status=%u error=%d\n",
+		   fault.sequence, fault.timestamp_ns, fault.ctx_id,
+		   fault.job_seq, fault.asid, fault.reason, fault.access,
+		   fault.flags, fault.va, fault.replay_token, fault.hw_status,
+		   fault.driver_error);
+
+	mutex_lock(&ndev->files_lock);
+	list_for_each_entry(nfile, &ndev->files, device_link) {
+		u64 next_sequence;
+		u32 count;
+
+		spin_lock_irqsave(&nfile->fault_lock, flags);
+		count = nfile->fault_count;
+		next_sequence = nfile->fault_sequence + 1;
+		spin_unlock_irqrestore(&nfile->fault_lock, flags);
+		seq_printf(m, "ctx=%llu asid=%u queued=%u next_sequence=%llu\n",
+			   nfile->ctx_id, nfile->asid, count, next_sequence);
+	}
+	mutex_unlock(&ndev->files_lock);
 	return 0;
 }
 
 static int nebulae_debugfs_registers(struct seq_file *m, void *data)
 {
 	struct nebulae_device *ndev = nebulae_debugfs_device(m);
+	int idx;
 	int i;
 
+	if (!drm_dev_enter(&ndev->drm, &idx))
+		return -ENODEV;
 	for (i = 0; i < ARRAY_SIZE(nebulae_debugfs_regs); i++) {
 		const struct nebulae_debugfs_reg *reg = &nebulae_debugfs_regs[i];
 
 		seq_printf(m, "%-32s 0x%04x: 0x%08x\n", reg->name,
 			   reg->reg, readl(ndev->regs + reg->reg));
 	}
+	drm_dev_exit(idx);
 
 	return 0;
 }
@@ -100,7 +145,7 @@ static int nebulae_debugfs_vm(struct seq_file *m, void *data)
 	struct drm_printer p = drm_seq_file_printer(m);
 
 	mutex_lock(&ndev->bo_lock);
-	drm_mm_print(&ndev->va_mm, &p);
+	drm_mm_print(&ndev->vram_mm, &p);
 	mutex_unlock(&ndev->bo_lock);
 
 	return 0;
@@ -117,8 +162,8 @@ static int nebulae_debugfs_bos(struct seq_file *m, void *data)
 	list_for_each_entry(bo, &ndev->bo_list, link) {
 		struct drm_gem_object *obj = &bo->base.base;
 
-		seq_printf(m, "bo%u va=0x%llx size=%zu flags=0x%08x domain=0x%08x listed=%d\n",
-			   count, bo->va, obj->size, bo->flags,
+		seq_printf(m, "bo%u vram=0x%llx size=%zu flags=0x%08x domain=0x%08x listed=%d\n",
+			   count, bo->vram_offset, obj->size, bo->flags,
 			   bo->domain, bo->listed);
 		total += obj->size;
 		count++;
@@ -177,6 +222,7 @@ static const struct drm_info_list nebulae_debugfs_files[] = {
 	{ "nebulae_vm", nebulae_debugfs_vm, 0 },
 	{ "nebulae_bos", nebulae_debugfs_bos, 0 },
 	{ "nebulae_submit", nebulae_debugfs_submit, 0 },
+	{ "nebulae_faults", nebulae_debugfs_faults, 0 },
 };
 
 void nebulae_debugfs_init(struct drm_minor *minor)

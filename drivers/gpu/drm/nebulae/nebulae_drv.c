@@ -10,6 +10,7 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/pm.h>
 
 #include <drm/drm_drv.h>
 #include <drm/drm_file.h>
@@ -43,6 +44,10 @@ static const struct drm_ioctl_desc nebulae_ioctls[] = {
 			  DRM_RENDER_ALLOW),
 	DRM_IOCTL_DEF_DRV(NEBULAE_VM_BIND, nebulae_ioctl_vm_bind,
 			  DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(NEBULAE_JOB_CONTROL, nebulae_ioctl_job_control,
+			  DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(NEBULAE_GET_FAULT, nebulae_ioctl_get_fault,
+			  DRM_RENDER_ALLOW),
 };
 
 DEFINE_DRM_GEM_FOPS(nebulae_fops);
@@ -50,7 +55,8 @@ DEFINE_DRM_GEM_FOPS(nebulae_fops);
 const struct drm_driver nebulae_gpu_drm_driver = {
 	.driver_features = DRIVER_GEM | DRIVER_RENDER | DRIVER_MODESET |
 			   DRIVER_ATOMIC | DRIVER_SYNCOBJ,
-	DRM_GEM_SHMEM_DRIVER_OPS,
+	.gem_prime_import_sg_table = drm_gem_shmem_prime_import_sg_table,
+	.dumb_create = nebulae_dumb_create,
 	.gem_prime_import = nebulae_gem_prime_import,
 	.open = nebulae_file_open,
 	.postclose = nebulae_file_postclose,
@@ -72,6 +78,13 @@ static const struct of_device_id nebulae_of_match[] = {
 };
 MODULE_DEVICE_TABLE(of, nebulae_of_match);
 
+static const struct dev_pm_ops nebulae_pm_ops = {
+	SET_SYSTEM_SLEEP_PM_OPS(nebulae_system_suspend,
+				nebulae_system_resume)
+	SET_RUNTIME_PM_OPS(nebulae_runtime_suspend,
+			   nebulae_runtime_resume, NULL)
+};
+
 static struct platform_driver nebulae_platform_driver = {
 	.probe = nebulae_device_probe,
 	.remove = nebulae_device_remove,
@@ -79,6 +92,7 @@ static struct platform_driver nebulae_platform_driver = {
 	.driver = {
 		.name = NEBULAE_GPU_PLATFORM_DRIVER_NAME,
 		.of_match_table = nebulae_of_match,
+		.pm = &nebulae_pm_ops,
 	},
 };
 module_platform_driver(nebulae_platform_driver);
