@@ -27,7 +27,16 @@ static const struct drm_connector_helper_funcs nebulae_connector_helper_funcs = 
 	.get_modes = nebulae_connector_get_modes,
 };
 
+static enum drm_connector_status
+nebulae_connector_detect(struct drm_connector *connector, bool force)
+{
+	/* This is an explicitly virtual, permanently attached output.  There is
+	 * no EDID or hotplug source in the v1 simulator. */
+	return connector_status_connected;
+}
+
 static const struct drm_connector_funcs nebulae_connector_funcs = {
+	.detect = nebulae_connector_detect,
 	.fill_modes = drm_helper_probe_single_connector_modes,
 	.reset = drm_atomic_helper_connector_reset,
 	.atomic_duplicate_state = drm_atomic_helper_connector_duplicate_state,
@@ -45,7 +54,7 @@ int nebulae_output_init(struct nebulae_device *ndev)
 	if (ret)
 		return ret;
 
-	ndev->connector.polled = DRM_CONNECTOR_POLL_CONNECT;
+	ndev->connector.polled = 0;
 	drm_connector_helper_add(&ndev->connector,
 				 &nebulae_connector_helper_funcs);
 	return 0;

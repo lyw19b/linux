@@ -7,8 +7,8 @@
 #include <linux/dma-resv.h>
 #include <linux/err.h>
 #include <linux/errno.h>
-#include <linux/io.h>
 #include <linux/iosys-map.h>
+#include <linux/jiffies.h>
 #include <linux/limits.h>
 #include <linux/mm.h>
 #include <linux/sched.h>
@@ -16,12 +16,15 @@
 
 #include <drm/drm_gem.h>
 #include <drm/drm_gem_shmem_helper.h>
+#include <drm/drm_mode.h>
 #include <drm/drm_prime.h>
 #include <drm/drm_vma_manager.h>
 
 #include "nebulae_internal.h"
 
 static const struct drm_gem_object_funcs nebulae_gem_object_funcs;
+static int nebulae_bo_wait_resv(struct nebulae_bo *bo,
+				enum dma_resv_usage usage);
 
 struct drm_gem_object *nebulae_gpu_gem_create_object(struct drm_device *drm,
 						     size_t size)
@@ -56,71 +59,103 @@ static void nebulae_gem_object_free(struct drm_gem_object *obj)
 	drm_gem_shmem_object_free(obj);
 }
 
-/* BOs created with the DEVICE_LOCAL placement are resident in the VRAM window;
- * their CPU mmap maps that window directly (write-combine) so guest writes land
- * in VRAM (== the simulator RAM after Tier-0 aliasing) with no shmem->VRAM
- * staging copy. */
-static bool nebulae_bo_vram_mapped(const struct nebulae_bo *bo)
-{
-	return (bo->flags & DRM_NEBULAE_BO_PLACEMENT_MASK) ==
-	       DRM_NEBULAE_BO_PLACEMENT_DEVICE_LOCAL;
-}
-
-static const struct vm_operations_struct nebulae_gem_vram_vm_ops = {
-	.open = drm_gem_vm_open,
-	.close = drm_gem_vm_close,
-};
-
-/* Map a VRAM-resident BO's window straight into userspace, modelled on
- * drivers/gpu/drm/virtio/virtgpu_vram.c.  bo->va is page-aligned (the VA
- * allocator hands out PAGE_ALIGN'd nodes from a page-aligned base). */
-static int nebulae_gem_mmap(struct drm_gem_object *obj,
-			    struct vm_area_struct *vma)
+static void nebulae_gem_object_close(struct drm_gem_object *obj,
+				     struct drm_file *file)
 {
 	struct nebulae_device *ndev = to_nebulae(obj->dev);
 	struct nebulae_bo *bo = to_nebulae_bo(obj);
-	unsigned long vm_size = vma->vm_end - vma->vm_start;
-	phys_addr_t phys;
+	struct nebulae_file *nfile = file->driver_priv;
+	u64 va;
+	int ret;
 
-	if (!nebulae_bo_vram_mapped(bo))
-		return drm_gem_shmem_object_mmap(obj, vma);
+	if (!nfile || nebulae_vm_bo_va(nfile, bo, &va))
+		return;
 
-	if (!bo->va || (bo->va & ~PAGE_MASK))
-		return -EINVAL;
-
-	vma->vm_pgoff -= drm_vma_node_start(&obj->vma_node);
-	if (((u64)vma->vm_pgoff << PAGE_SHIFT) + vm_size > obj->size)
-		return -EINVAL;
-	phys = ndev->vram_phys + bo->va +
-	       ((phys_addr_t)vma->vm_pgoff << PAGE_SHIFT);
-
-	vm_flags_set(vma, VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
-	vma->vm_page_prot = pgprot_writecombine(vm_get_page_prot(vma->vm_flags));
-	vma->vm_ops = &nebulae_gem_vram_vm_ops;
-
-	return io_remap_pfn_range(vma, vma->vm_start, phys >> PAGE_SHIFT,
-				  vm_size, vma->vm_page_prot);
+	/* GEM close runs before driver postclose and must never turn process exit
+	 * into an uninterruptible fence wait.  Each committed job pins its VMAs;
+	 * unmap is immediate when idle or deferred to the last job otherwise. */
+	ret = nebulae_vm_unmap_bo(ndev, nfile, bo, true);
+	if (ret && ret != -ENOENT && ret != -EINPROGRESS)
+		drm_warn(obj->dev, "failed to release BO GPUVA on close: %d\n",
+			 ret);
 }
 
 static const struct drm_gem_object_funcs nebulae_gem_object_funcs = {
 	.free = nebulae_gem_object_free,
+	.close = nebulae_gem_object_close,
 	.print_info = drm_gem_shmem_object_print_info,
 	.pin = drm_gem_shmem_object_pin,
 	.unpin = drm_gem_shmem_object_unpin,
 	.get_sg_table = drm_gem_shmem_object_get_sg_table,
 	.vmap = drm_gem_shmem_object_vmap,
 	.vunmap = drm_gem_shmem_object_vunmap,
-	.mmap = nebulae_gem_mmap,
+	/* shmem is the sole CPU-authoritative backing for every placement.  VRAM
+	 * is a device residency copy, never a second userspace-visible backing. */
+	.mmap = drm_gem_shmem_object_mmap,
 	.vm_ops = &drm_gem_shmem_vm_ops,
 };
 
-static bool nebulae_bo_gpu_resident(const struct nebulae_bo *bo)
+static int nebulae_bo_create_handle(struct drm_device *drm,
+				    struct drm_file *file,
+				    u64 requested_size, u32 flags,
+				    u32 *handle, u64 *va)
 {
-	return (bo->flags & DRM_NEBULAE_BO_PLACEMENT_MASK) ==
-		       DRM_NEBULAE_BO_PLACEMENT_SHARED ||
-	       (bo->flags & DRM_NEBULAE_BO_PLACEMENT_MASK) ==
-		       DRM_NEBULAE_BO_PLACEMENT_DEVICE_LOCAL ||
-	       (bo->domain & DRM_NEBULAE_BO_DOMAIN_SCANOUT);
+	struct nebulae_device *ndev = to_nebulae(drm);
+	struct drm_gem_shmem_object *shmem;
+	struct nebulae_bo *bo;
+	u64 mapped_va;
+	size_t size;
+	int ret;
+
+	if (!requested_size || (flags & ~DRM_NEBULAE_BO_FLAGS))
+		return -EINVAL;
+	if (requested_size > SIZE_MAX)
+		return -EOVERFLOW;
+
+	size = PAGE_ALIGN((size_t)requested_size);
+	if (!size)
+		return -EINVAL;
+
+	shmem = drm_gem_shmem_create(drm, size);
+	if (IS_ERR(shmem))
+		return PTR_ERR(shmem);
+
+	bo = to_nebulae_bo(&shmem->base);
+	bo->flags = flags;
+	bo->domain = DRM_NEBULAE_BO_DOMAIN_CPU;
+	shmem->map_wc = flags & DRM_NEBULAE_BO_WC;
+
+	ret = nebulae_alloc_bo_va(ndev, bo, size);
+	if (ret)
+		goto err_put;
+
+	/* Map this BO into the creating client's own address space, so its waves
+	 * can reach it and other clients (with different page tables) cannot. */
+	ret = nebulae_vm_map_bo(ndev, file->driver_priv, bo, &mapped_va);
+	if (ret)
+		goto err_free_va;
+
+	mutex_lock(&ndev->bo_lock);
+	if (!bo->listed) {
+		list_add_tail(&bo->link, &ndev->bo_list);
+		bo->listed = true;
+	}
+	mutex_unlock(&ndev->bo_lock);
+
+	ret = drm_gem_handle_create(file, &shmem->base, handle);
+	if (ret) {
+		nebulae_vm_unmap_bo(ndev, file->driver_priv, bo, false);
+	} else if (va) {
+		*va = mapped_va;
+	}
+	drm_gem_object_put(&shmem->base);
+	return ret;
+
+err_free_va:
+	nebulae_free_bo_va(ndev, bo);
+err_put:
+	drm_gem_object_put(&shmem->base);
+	return ret;
 }
 
 static int nebulae_bo_wait_resv(struct nebulae_bo *bo,
@@ -137,20 +172,22 @@ static int nebulae_bo_wait_resv(struct nebulae_bo *bo,
 	return 0;
 }
 
-static int nebulae_bo_sync_to_vram(struct nebulae_device *ndev,
-				   struct nebulae_bo *bo)
+static int nebulae_bo_copy_to_vram(struct nebulae_device *ndev,
+				   struct nebulae_bo *bo, bool wait)
 {
 	struct drm_gem_object *obj = &bo->base.base;
 	struct iosys_map map;
 	int ret;
 
-	if (!bo->va || bo->va >= ndev->vram_size ||
-	    obj->size > ndev->vram_size - bo->va)
+	if (!bo->vram_offset || bo->vram_offset >= ndev->vram_size ||
+	    obj->size > ndev->vram_size - bo->vram_offset)
 		return -EINVAL;
 
-	ret = nebulae_bo_wait_resv(bo, DMA_RESV_USAGE_WRITE);
-	if (ret)
-		return ret;
+	if (wait) {
+		ret = nebulae_bo_wait_resv(bo, DMA_RESV_USAGE_WRITE);
+		if (ret)
+			return ret;
+	}
 
 	/* drm_gem_shmem_vmap/vunmap assert the reservation lock is held and
 	 * mutate pages_use_count; without it they race the KMS shadow-blit and
@@ -171,7 +208,7 @@ static int nebulae_bo_sync_to_vram(struct nebulae_device *ndev,
 		return -EINVAL;
 	}
 
-	memcpy_toio(ndev->vram + bo->va, map.vaddr, obj->size);
+	memcpy_toio(ndev->vram + bo->vram_offset, map.vaddr, obj->size);
 	bo->domain &= ~DRM_NEBULAE_BO_DOMAIN_CPU;
 	bo->domain |= DRM_NEBULAE_BO_DOMAIN_GPU;
 	drm_gem_shmem_vunmap(&bo->base, &map);
@@ -179,20 +216,34 @@ static int nebulae_bo_sync_to_vram(struct nebulae_device *ndev,
 	return 0;
 }
 
-int nebulae_bo_sync_from_vram(struct nebulae_device *ndev,
-			      struct nebulae_bo *bo)
+int nebulae_bo_sync_to_vram(struct nebulae_device *ndev,
+			    struct nebulae_bo *bo)
+{
+	return nebulae_bo_copy_to_vram(ndev, bo, true);
+}
+
+int nebulae_bo_sync_to_vram_nowait(struct nebulae_device *ndev,
+				   struct nebulae_bo *bo)
+{
+	return nebulae_bo_copy_to_vram(ndev, bo, false);
+}
+
+static int nebulae_bo_copy_from_vram(struct nebulae_device *ndev,
+				     struct nebulae_bo *bo, bool wait)
 {
 	struct drm_gem_object *obj = &bo->base.base;
 	struct iosys_map map;
 	int ret;
 
-	if (!bo->va || bo->va >= ndev->vram_size ||
-	    obj->size > ndev->vram_size - bo->va)
+	if (!bo->vram_offset || bo->vram_offset >= ndev->vram_size ||
+	    obj->size > ndev->vram_size - bo->vram_offset)
 		return -EINVAL;
 
-	ret = nebulae_bo_wait_resv(bo, DMA_RESV_USAGE_READ);
-	if (ret)
-		return ret;
+	if (wait) {
+		ret = nebulae_bo_wait_resv(bo, DMA_RESV_USAGE_READ);
+		if (ret)
+			return ret;
+	}
 
 	/* See nebulae_bo_sync_to_vram: the reservation lock is required around
 	 * drm_gem_shmem_vmap/vunmap to avoid racing page teardown. */
@@ -211,7 +262,7 @@ int nebulae_bo_sync_from_vram(struct nebulae_device *ndev,
 		return -EINVAL;
 	}
 
-	memcpy_fromio(map.vaddr, ndev->vram + bo->va, obj->size);
+	memcpy_fromio(map.vaddr, ndev->vram + bo->vram_offset, obj->size);
 	bo->domain &= ~DRM_NEBULAE_BO_DOMAIN_GPU;
 	bo->domain |= DRM_NEBULAE_BO_DOMAIN_CPU;
 	drm_gem_shmem_vunmap(&bo->base, &map);
@@ -219,129 +270,86 @@ int nebulae_bo_sync_from_vram(struct nebulae_device *ndev,
 	return 0;
 }
 
-static bool nebulae_bo_should_sync_to_vram(struct nebulae_bo *bo)
+int nebulae_bo_sync_from_vram(struct nebulae_device *ndev,
+			      struct nebulae_bo *bo)
 {
-	if (!bo->listed || !bo->va)
-		return false;
-
-	/* VRAM-mapped BOs are written by the CPU straight into VRAM; their shmem
-	 * is unused, so staging it in would clobber the real contents. */
-	if (nebulae_bo_vram_mapped(bo))
-		return false;
-
-	return !nebulae_bo_gpu_resident(bo) ||
-	       (bo->domain & DRM_NEBULAE_BO_DOMAIN_CPU);
+	return nebulae_bo_copy_from_vram(ndev, bo, true);
 }
 
-static bool nebulae_bo_should_sync_from_vram(struct nebulae_bo *bo)
+int nebulae_bo_sync_from_vram_nowait(struct nebulae_device *ndev,
+				     struct nebulae_bo *bo)
 {
-	if (!bo->listed || !bo->va)
-		return false;
-
-	if (nebulae_bo_vram_mapped(bo))
-		return false;
-
-	return !nebulae_bo_gpu_resident(bo);
-}
-
-int nebulae_sync_all_bos_to_vram(struct nebulae_device *ndev)
-{
-	struct nebulae_bo *bo;
-	int ret = 0;
-
-	mutex_lock(&ndev->bo_lock);
-	list_for_each_entry(bo, &ndev->bo_list, link) {
-		if (!nebulae_bo_should_sync_to_vram(bo))
-			continue;
-
-		ret = nebulae_bo_sync_to_vram(ndev, bo);
-		if (ret)
-			break;
-	}
-	mutex_unlock(&ndev->bo_lock);
-
-	return ret;
-}
-
-int nebulae_sync_all_bos_from_vram(struct nebulae_device *ndev)
-{
-	struct nebulae_bo *bo;
-	int ret = 0;
-
-	mutex_lock(&ndev->bo_lock);
-	list_for_each_entry(bo, &ndev->bo_list, link) {
-		if (!bo->listed || !bo->va)
-			continue;
-		if (!nebulae_bo_should_sync_from_vram(bo)) {
-			bo->domain &= ~DRM_NEBULAE_BO_DOMAIN_CPU;
-			bo->domain |= DRM_NEBULAE_BO_DOMAIN_GPU;
-			continue;
-		}
-
-		ret = nebulae_bo_sync_from_vram(ndev, bo);
-		if (ret)
-			break;
-	}
-	mutex_unlock(&ndev->bo_lock);
-
-	return ret;
+	return nebulae_bo_copy_from_vram(ndev, bo, false);
 }
 
 int nebulae_ioctl_bo_create(struct drm_device *drm, void *data,
 			    struct drm_file *file)
 {
-	struct nebulae_device *ndev = to_nebulae(drm);
 	struct drm_nebulae_bo_create *args = data;
-	struct drm_gem_shmem_object *shmem;
-	struct nebulae_bo *bo;
-	size_t size;
+	int idx;
 	int ret;
 
-	if (!args->size || (args->flags & ~DRM_NEBULAE_BO_FLAGS))
+	ret = nebulae_device_enter(to_nebulae(drm), &idx);
+	if (ret)
+		return ret;
+	ret = nebulae_bo_create_handle(drm, file, args->size, args->flags,
+				       &args->handle, &args->va);
+	nebulae_device_exit(to_nebulae(drm), idx);
+	return ret;
+}
+
+static int nebulae_dumb_create_active(struct drm_file *file,
+				      struct drm_device *drm,
+				      struct drm_mode_create_dumb *args)
+{
+	u64 min_pitch;
+	u64 size;
+	u32 flags;
+	int ret;
+
+	if (!args->width || !args->height || !args->bpp)
 		return -EINVAL;
 
-	if (args->size > SIZE_MAX)
+	min_pitch = DIV_ROUND_UP_ULL((u64)args->width * args->bpp, 8);
+	min_pitch = ALIGN(min_pitch, 64);
+	if (min_pitch > U32_MAX)
 		return -EOVERFLOW;
 
-	size = PAGE_ALIGN((size_t)args->size);
+	if (!args->pitch || args->pitch < min_pitch)
+		args->pitch = min_pitch;
+
+	size = (u64)args->pitch * args->height;
+	if (args->height && size / args->height != args->pitch)
+		return -EOVERFLOW;
+	size = PAGE_ALIGN(size);
 	if (!size)
 		return -EINVAL;
+	args->size = size;
 
-	shmem = drm_gem_shmem_create(drm, size);
-	if (IS_ERR(shmem))
-		return PTR_ERR(shmem);
-
-	bo = to_nebulae_bo(&shmem->base);
-	bo->flags = args->flags;
-	bo->domain = DRM_NEBULAE_BO_DOMAIN_CPU;
-	shmem->map_wc = args->flags & DRM_NEBULAE_BO_WC;
-
-	ret = nebulae_alloc_bo_va(ndev, bo, size);
-	if (ret) {
-		drm_gem_object_put(&shmem->base);
-		return ret;
-	}
-
-	/* Map this BO into the creating client's own address space, so its waves
-	 * can reach it and other clients (with different page tables) cannot. */
-	ret = nebulae_mmu_map(ndev, file->driver_priv, bo->va, size);
-	if (ret) {
-		nebulae_free_bo_va(ndev, bo);
-		drm_gem_object_put(&shmem->base);
-		return ret;
-	}
-
-	mutex_lock(&ndev->bo_lock);
-	if (!bo->listed) {
-		list_add_tail(&bo->link, &ndev->bo_list);
-		bo->listed = true;
-	}
-	mutex_unlock(&ndev->bo_lock);
-
-	ret = drm_gem_handle_create(file, &shmem->base, &args->handle);
+	flags = DRM_NEBULAE_BO_WC |
+		DRM_NEBULAE_BO_PLACEMENT_DEVICE_LOCAL |
+		DRM_NEBULAE_BO_TYPE_RESOURCE;
+	ret = nebulae_bo_create_handle(drm, file, args->size, flags,
+				       &args->handle, NULL);
 	if (!ret)
-		args->va = bo->va;
-	drm_gem_object_put(&shmem->base);
+		drm_dbg_kms(drm,
+			    "dumb_create: %ux%u bpp=%u pitch=%u size=%llu flags=0x%x\n",
+			    args->width, args->height, args->bpp, args->pitch,
+			    args->size, flags);
+	return ret;
+}
+
+int nebulae_dumb_create(struct drm_file *file, struct drm_device *drm,
+			struct drm_mode_create_dumb *args)
+{
+	int idx;
+	int ret;
+
+	ret = nebulae_device_enter(to_nebulae(drm), &idx);
+	if (ret)
+		return ret;
+	ret = nebulae_dumb_create_active(file, drm, args);
+	nebulae_device_exit(to_nebulae(drm), idx);
 	return ret;
 }
 
@@ -359,39 +367,62 @@ int nebulae_ioctl_bo_mmap(struct drm_device *drm, void *data,
 /* Map (or unmap) a BO into the calling client's address space.  Needed for
  * PRIME-imported BOs, which have no owning file at import time and so are not
  * mapped by the create path; the importer VM_BINDs them before use. */
-int nebulae_ioctl_vm_bind(struct drm_device *drm, void *data,
-			  struct drm_file *file)
+static int nebulae_ioctl_vm_bind_active(struct drm_device *drm, void *data,
+					struct drm_file *file)
 {
 	struct nebulae_device *ndev = to_nebulae(drm);
 	struct nebulae_file *nfile = file->driver_priv;
 	struct drm_nebulae_vm_bind *args = data;
 	struct drm_gem_object *obj;
 	struct nebulae_bo *bo;
+	u64 va = 0;
 	int ret = 0;
+
+	if (args->reserved[0] || args->reserved[1])
+		return -EINVAL;
+	if (args->op != DRM_NEBULAE_VM_BIND_OP_MAP &&
+	    args->op != DRM_NEBULAE_VM_BIND_OP_UNMAP)
+		return -EINVAL;
 
 	obj = drm_gem_object_lookup(file, args->handle);
 	if (!obj)
 		return -ENOENT;
 	bo = to_nebulae_bo(obj);
-	if (!bo->va) {
+	if (!bo->vram_offset) {
 		drm_gem_object_put(obj);
 		return -EINVAL;
 	}
 
-	if (args->op == DRM_NEBULAE_VM_BIND_OP_UNMAP)
-		nebulae_mmu_unmap(ndev, nfile, bo->va, obj->size);
-	else
-		ret = nebulae_mmu_map(ndev, nfile, bo->va, obj->size);
+	ret = nebulae_vm_bo_va(nfile, bo, &va);
+	if (args->op == DRM_NEBULAE_VM_BIND_OP_UNMAP) {
+		if (ret)
+			goto out_put;
+		ret = nebulae_vm_unmap_bo(ndev, nfile, bo, false);
+	} else {
+		/* MAP is idempotent for a handle already bound in this file. */
+		if (ret == -ENOENT)
+			ret = nebulae_vm_map_bo(ndev, nfile, bo, &va);
+		else if (!ret)
+			ret = 0;
+	}
+	args->va = va;
 
-	/* Diagnostic: confirm the VM_BIND prime path maps imported BOs into the
-	 * per-ASID page table.  info-level so it reaches console=ttyS0. */
-	drm_info(drm,
-		 "VM_BIND: op=%s handle=%u va=0x%llx size=%zu asid=%u imported=%d ret=%d\n",
-		 args->op == DRM_NEBULAE_VM_BIND_OP_UNMAP ? "unmap" : "map",
-		 args->handle, bo->va, obj->size, nfile->asid,
-		 obj->import_attach != NULL, ret);
-
+out_put:
 	drm_gem_object_put(obj);
+	return ret;
+}
+
+int nebulae_ioctl_vm_bind(struct drm_device *drm, void *data,
+			  struct drm_file *file)
+{
+	int idx;
+	int ret;
+
+	ret = nebulae_device_enter(to_nebulae(drm), &idx);
+	if (ret)
+		return ret;
+	ret = nebulae_ioctl_vm_bind_active(drm, data, file);
+	nebulae_device_exit(to_nebulae(drm), idx);
 	return ret;
 }
 
@@ -400,6 +431,8 @@ int nebulae_ioctl_bo_wait(struct drm_device *drm, void *data,
 {
 	struct drm_nebulae_bo_wait *args = data;
 	struct drm_gem_object *obj;
+	unsigned long timeout = MAX_SCHEDULE_TIMEOUT;
+	long ret;
 
 	if (args->pad)
 		return -EINVAL;
@@ -408,26 +441,92 @@ int nebulae_ioctl_bo_wait(struct drm_device *drm, void *data,
 	if (!obj)
 		return -ENOENT;
 
+	if (args->timeout_ns) {
+		u64 jiffies64 = nsecs_to_jiffies64(args->timeout_ns);
+
+		timeout = min_t(u64, jiffies64 ?: 1, MAX_SCHEDULE_TIMEOUT);
+	}
+	ret = dma_resv_wait_timeout(obj->resv, DMA_RESV_USAGE_READ, true,
+				    timeout);
+	if (!ret)
+		ret = -ETIMEDOUT;
 	drm_gem_object_put(obj);
-	return 0;
+	return ret < 0 ? ret : 0;
+}
+
+static int nebulae_ioctl_madvise_active(struct drm_device *drm, void *data,
+					struct drm_file *file)
+{
+	struct drm_nebulae_madvise *args = data;
+	struct drm_gem_object *obj;
+	struct nebulae_bo *bo;
+	int ret;
+
+	if (args->pad || (args->madv != DRM_NEBULAE_MADV_WILLNEED &&
+			  args->madv != DRM_NEBULAE_MADV_DONTNEED))
+		return -EINVAL;
+
+	obj = drm_gem_object_lookup(file, args->handle);
+	if (!obj)
+		return -ENOENT;
+
+	bo = to_nebulae_bo(obj);
+	/* An imported object has an external backing lifetime; pretending it can
+	 * be purged would corrupt aliases. */
+	if (obj->import_attach || obj->dma_buf) {
+		ret = -EOPNOTSUPP;
+		goto out_put;
+	}
+
+	ret = dma_resv_lock_interruptible(obj->resv, NULL);
+	if (ret)
+		goto out_put;
+
+	args->retained = drm_gem_shmem_madvise(&bo->base, args->madv);
+	if (args->madv == DRM_NEBULAE_MADV_DONTNEED &&
+	    drm_gem_shmem_is_purgeable(&bo->base)) {
+		int unmap_ret;
+
+		/* Remove the caller's GPU mapping before discarding pages so the GPU
+		 * can never observe stale VRAM after retained becomes false. */
+		unmap_ret = nebulae_vm_unmap_bo(to_nebulae(drm),
+						 file->driver_priv, bo, false);
+		if (!unmap_ret || unmap_ret == -ENOENT) {
+			drm_gem_shmem_purge(&bo->base);
+			args->retained = 0;
+		} else if (unmap_ret == -EBUSY) {
+			/* An in-flight job still owns the pages.  Retain both the object and
+			 * its usable mapping; userspace may retry after retirement. */
+			args->retained = 1;
+		} else {
+			ret = unmap_ret;
+			goto out_unlock;
+		}
+	}
+	dma_resv_unlock(obj->resv);
+	ret = 0;
+	goto out_put;
+
+out_unlock:
+	dma_resv_unlock(obj->resv);
+
+out_put:
+	drm_gem_object_put(obj);
+	return ret;
 }
 
 int nebulae_ioctl_madvise(struct drm_device *drm, void *data,
 			  struct drm_file *file)
 {
-	struct drm_nebulae_madvise *args = data;
-	struct drm_gem_object *obj;
+	int idx;
+	int ret;
 
-	if (args->pad)
-		return -EINVAL;
-
-	obj = drm_gem_object_lookup(file, args->handle);
-	if (!obj)
-		return -ENOENT;
-
-	args->retained = 1;
-	drm_gem_object_put(obj);
-	return 0;
+	ret = nebulae_device_enter(to_nebulae(drm), &idx);
+	if (ret)
+		return ret;
+	ret = nebulae_ioctl_madvise_active(drm, data, file);
+	nebulae_device_exit(to_nebulae(drm), idx);
+	return ret;
 }
 
 int nebulae_ioctl_bo_info(struct drm_device *drm, void *data,
@@ -436,19 +535,26 @@ int nebulae_ioctl_bo_info(struct drm_device *drm, void *data,
 	struct drm_nebulae_bo_info *args = data;
 	struct drm_gem_object *obj;
 	struct nebulae_bo *bo;
+	u64 va;
+	int ret;
 
 	obj = drm_gem_object_lookup(file, args->handle);
 	if (!obj)
 		return -ENOENT;
 
 	bo = to_nebulae_bo(obj);
+	ret = nebulae_vm_bo_va(file->driver_priv, bo, &va);
+	if (ret) {
+		drm_gem_object_put(obj);
+		return ret;
+	}
 	args->flags = bo->flags;
 	args->size = obj->size;
-	args->va = bo->va;
+	args->va = va;
 	args->placement = bo->flags & DRM_NEBULAE_BO_PLACEMENT_MASK;
 	args->domain = bo->domain;
 	drm_gem_object_put(obj);
-	return bo->va ? 0 : -EINVAL;
+	return 0;
 }
 
 static bool nebulae_bo_write_domain_valid(u32 domain)
@@ -457,8 +563,9 @@ static bool nebulae_bo_write_domain_valid(u32 domain)
 	       domain == DRM_NEBULAE_BO_DOMAIN_GPU;
 }
 
-int nebulae_ioctl_bo_set_domain(struct drm_device *drm, void *data,
-				struct drm_file *file)
+static int nebulae_ioctl_bo_set_domain_active(struct drm_device *drm,
+					      void *data,
+					      struct drm_file *file)
 {
 	struct nebulae_device *ndev = to_nebulae(drm);
 	struct drm_nebulae_bo_set_domain *args = data;
@@ -478,10 +585,12 @@ int nebulae_ioctl_bo_set_domain(struct drm_device *drm, void *data,
 
 	bo = to_nebulae_bo(obj);
 
-	mutex_lock(&ndev->bo_lock);
-	if ((args->read_domains & DRM_NEBULAE_BO_DOMAIN_GPU) &&
-	    (bo->domain & DRM_NEBULAE_BO_DOMAIN_CPU))
-		ret = nebulae_bo_sync_to_vram(ndev, bo);
+	if (args->read_domains & DRM_NEBULAE_BO_DOMAIN_GPU) {
+		if (bo->domain & DRM_NEBULAE_BO_DOMAIN_CPU)
+			ret = nebulae_bo_sync_to_vram(ndev, bo);
+		else
+			ret = nebulae_bo_wait_resv(bo, DMA_RESV_USAGE_WRITE);
+	}
 	if (!ret && (args->read_domains & DRM_NEBULAE_BO_DOMAIN_CPU) &&
 	    (bo->domain & DRM_NEBULAE_BO_DOMAIN_GPU))
 		ret = nebulae_bo_sync_from_vram(ndev, bo);
@@ -500,9 +609,22 @@ int nebulae_ioctl_bo_set_domain(struct drm_device *drm, void *data,
 			}
 		}
 	}
-	mutex_unlock(&ndev->bo_lock);
 
 	drm_gem_object_put(obj);
+	return ret;
+}
+
+int nebulae_ioctl_bo_set_domain(struct drm_device *drm, void *data,
+				struct drm_file *file)
+{
+	int idx;
+	int ret;
+
+	ret = nebulae_device_enter(to_nebulae(drm), &idx);
+	if (ret)
+		return ret;
+	ret = nebulae_ioctl_bo_set_domain_active(drm, data, file);
+	nebulae_device_exit(to_nebulae(drm), idx);
 	return ret;
 }
 
@@ -524,7 +646,7 @@ struct drm_gem_object *nebulae_gem_prime_import(struct drm_device *drm,
 		return obj;
 
 	bo = to_nebulae_bo(obj);
-	if (!bo->va) {
+	if (!bo->vram_offset) {
 		ret = nebulae_alloc_bo_va(ndev, bo, obj->size);
 		if (ret) {
 			drm_gem_object_put(obj);

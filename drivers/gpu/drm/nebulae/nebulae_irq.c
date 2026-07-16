@@ -1,12 +1,35 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Nebulae IRQ handling.
+ * Nebulae IRQ handling.  The hard IRQ only acknowledges registers and queues
+ * work; completion tears down GPUVM mappings and therefore runs in process
+ * context.
  */
 
 #include <linux/atomic.h>
 #include <linux/io.h>
 
 #include "nebulae_internal.h"
+
+static void nebulae_irq_work(struct work_struct *work)
+{
+	struct nebulae_device *ndev =
+		container_of(work, struct nebulae_device, irq_work);
+	u32 status = atomic_xchg(&ndev->pending_irq, 0);
+
+	if (status & (NEB_IRQ_COMPLETE | NEB_IRQ_FAULT))
+		nebulae_submit_irq_process(ndev, status);
+}
+
+void nebulae_irq_init(struct nebulae_device *ndev)
+{
+	atomic_set(&ndev->pending_irq, 0);
+	INIT_WORK(&ndev->irq_work, nebulae_irq_work);
+}
+
+void nebulae_irq_fini(struct nebulae_device *ndev)
+{
+	cancel_work_sync(&ndev->irq_work);
+}
 
 irqreturn_t nebulae_gpu_irq(int irq, void *data)
 {
@@ -28,25 +51,21 @@ irqreturn_t nebulae_gpu_irq(int irq, void *data)
 	ndev->last_display_irq_status = display_status;
 	atomic64_inc(&ndev->irq_count);
 
-	if (status & NEB_IRQ_COMPLETE) {
+	if (status & NEB_IRQ_COMPLETE)
 		atomic64_inc(&ndev->complete_irq_count);
-	}
-
 	if (status & NEB_IRQ_FAULT) {
 		atomic64_inc(&ndev->fault_irq_count);
 		WRITE_ONCE(ndev->last_error,
 			   readl(ndev->regs + NEB_REG_LAST_ERROR));
 	}
-
-	if (status & (NEB_IRQ_COMPLETE | NEB_IRQ_FAULT)) {
-		atomic64_set(&ndev->completed_jobs,
-			     neb_readq(ndev, NEB_REG_COMPLETED_SEQ_LO));
-		wake_up_all(&ndev->submit_wait);
-	}
-
 	if ((status & NEB_IRQ_DISPLAY) ||
 	    (display_status & NEB_DISPLAY_IRQ_FLIP_DONE))
 		atomic64_inc(&ndev->display_irq_count);
+
+	if (status & (NEB_IRQ_COMPLETE | NEB_IRQ_FAULT)) {
+		atomic_or(status, &ndev->pending_irq);
+		schedule_work(&ndev->irq_work);
+	}
 
 	return IRQ_HANDLED;
 }
